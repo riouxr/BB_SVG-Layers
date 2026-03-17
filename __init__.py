@@ -37,10 +37,7 @@ def gather_objects(context):
 
 
 def apply_uv_projection_y(obj):
-    """
-    Project UVs from the Y axis.
-    U = X / 1920,  V = Z / 1920  →  fits a 1920×1920 px canvas in [0, 1].
-    """
+    """U = X / 1920, V = Z / 1920 — projects from Y axis onto 1920x1920 canvas."""
     mesh = obj.data
     if not mesh.uv_layers:
         mesh.uv_layers.new(name="UVMap")
@@ -54,7 +51,6 @@ def apply_uv_projection_y(obj):
 
 
 def find_blend_files_in_library(library_path):
-    """Recursively find all .blend files under a library root path."""
     blend_files = []
     for root, dirs, files in os.walk(library_path):
         for f in files:
@@ -66,53 +62,63 @@ def find_blend_files_in_library(library_path):
 ASSET_LIBRARY_NAME = "Paper"
 
 
-def append_material_from_libraries(mat_name):
+def find_library_blend_file(context):
+    """Find ONLY .blend files whose path contains ASSET_LIBRARY_NAME."""
+    asset_libs = context.preferences.filepaths.asset_libraries
+    result = []
+    for lib in asset_libs:
+        lib_root = os.path.normpath(bpy.path.abspath(lib.path))
+        for blend_path in find_blend_files_in_library(lib_root):
+            if ASSET_LIBRARY_NAME.lower() in blend_path.lower():
+                result.append(blend_path)
+    return result
+
+
+def append_material_from_library(context, mat_name, blend_files):
     """
-    Search the 'Paper' asset library for a material named mat_name.
-    If found, append it into the current file and return the material.
-    If it already exists in bpy.data.materials, return it immediately.
+    Append material by name from the Paper library blend files.
+    Returns the material or None.
     """
-    # Already loaded — no need to append again
     existing = bpy.data.materials.get(mat_name)
-    if existing is not None:
+    if existing is not None and not existing.name.startswith('SVGMat'):
         return existing
 
-    asset_libs = bpy.context.preferences.filepaths.asset_libraries
-    paper_lib = next((lib for lib in asset_libs if lib.name == ASSET_LIBRARY_NAME), None)
-
-    if paper_lib is None:
-        print(f"SVG Layer: Asset library '{ASSET_LIBRARY_NAME}' not found in Preferences.")
-        return None
-
-    lib_path = bpy.path.abspath(paper_lib.path)
-    if not os.path.isdir(lib_path):
-        print(f"SVG Layer: Library path does not exist: {lib_path}")
-        return None
-
-    for blend_path in find_blend_files_in_library(lib_path):
-        with bpy.data.libraries.load(blend_path, assets_only=True) as (data_from, data_to):
-            if mat_name in data_from.materials:
+    for blend_path in blend_files:
+        try:
+            with bpy.data.libraries.load(blend_path, assets_only=True) as (data_from, data_to):
+                if mat_name not in data_from.materials:
+                    continue
+                names_before = set(m.name for m in bpy.data.materials)
                 data_to.materials = [mat_name]
 
-        mat = bpy.data.materials.get(mat_name)
-        if mat is not None:
-            return mat
+            mat = bpy.data.materials.get(mat_name)
+            if mat is not None:
+                return mat
+
+            names_after = set(m.name for m in bpy.data.materials)
+            for new_name in (names_after - names_before):
+                if new_name.split('.')[0] == mat_name:
+                    mat = bpy.data.materials.get(new_name)
+                    if mat:
+                        mat.name = mat_name
+                        return mat
+        except Exception as e:
+            print(f"SVG Layer: Error reading {blend_path}: {e}")
 
     return None
 
 
 # ─────────────────────────────────────────────
-#  Main Operator
+#  Operator: Apply SVG Layers
 # ─────────────────────────────────────────────
 
 class SVG_OT_ApplyLayers(bpy.types.Operator):
-    """Rotate, scale, convert, merge, offset, UV-project, solidify and assign asset material"""
+    """Rotate, scale, convert curves, merge, UV-project, solidify and assign material"""
     bl_idname = "svg_layer.apply_layers"
     bl_label = "Apply SVG Layers"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        step = context.scene.svg_layer_offset
         objects = gather_objects(context)
 
         if not objects:
@@ -122,10 +128,9 @@ class SVG_OT_ApplyLayers(bpy.types.Operator):
         if context.object and context.object.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
 
-        n = len(objects)
+        blend_files = find_library_blend_file(context)
 
-        for i, obj in enumerate(objects):
-
+        for obj in objects:
             bpy.ops.object.select_all(action='DESELECT')
             obj.select_set(True)
             context.view_layer.objects.active = obj
@@ -153,32 +158,27 @@ class SVG_OT_ApplyLayers(bpy.types.Operator):
                 bpy.ops.mesh.remove_doubles(threshold=0.0001)
                 bpy.ops.object.mode_set(mode='OBJECT')
 
-            # 6. Cumulative -Y offset (last object = base / no offset)
-            obj.location.y -= i * step
-
-            # 7. UV projection from Y axis (1920×1920 canvas)
+            # 6. UV projection from Y axis (1920×1920 canvas)
             if obj.type == 'MESH':
                 apply_uv_projection_y(obj)
 
-            # 8. Solidify modifier
+            # 7. Solidify modifier
             for m in [m for m in obj.modifiers if m.type == 'SOLIDIFY']:
                 obj.modifiers.remove(m)
             solidify = obj.modifiers.new(name="Solidify", type='SOLIDIFY')
-            solidify.thickness = 0.003
+            solidify.thickness = 2
             solidify.offset = -1.0
 
-            # 9. Assign material — search asset libraries by prefix name
-            #    e.g. "Layer_01.003" → looks for material "Layer_01"
+            # 8. Assign material by prefix (e.g. "Sky.002" → "Sky")
             mat_name = obj.name.split('.')[0]
-            mat = append_material_from_libraries(mat_name)
+            mat = append_material_from_library(context, mat_name, blend_files)
             if mat is not None:
                 if obj.data.materials:
                     obj.data.materials[0] = mat
                 else:
                     obj.data.materials.append(mat)
             else:
-                self.report({'WARNING'},
-                    f"Material '{mat_name}' not found in any asset library.")
+                self.report({'WARNING'}, f"Material '{mat_name}' not found in '{ASSET_LIBRARY_NAME}' library.")
 
         # Restore selection
         bpy.ops.object.select_all(action='DESELECT')
@@ -188,7 +188,134 @@ class SVG_OT_ApplyLayers(bpy.types.Operator):
             except ReferenceError:
                 pass
 
-        self.report({'INFO'}, f"SVG Layers applied to {n} object(s).")
+        self.report({'INFO'}, f"SVG Layers applied to {len(objects)} object(s).")
+        return {'FINISHED'}
+
+
+# ─────────────────────────────────────────────
+#  Operator: Offset
+# ─────────────────────────────────────────────
+
+class SVG_OT_ApplyOffset(bpy.types.Operator):
+    """Apply cumulative -Y offset. Last object = front (no offset), first = furthest back."""
+    bl_idname = "svg_layer.apply_offset"
+    bl_label = "Offset"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        step = context.scene.svg_layer_offset
+        objects = gather_objects(context)
+
+        if not objects:
+            self.report({'WARNING'}, "No objects found.")
+            return {'CANCELLED'}
+
+        for i, obj in enumerate(objects):
+            obj.location.y -= i * step
+
+        self.report({'INFO'}, f"Offset applied to {len(objects)} object(s).")
+        return {'FINISHED'}
+
+
+# ─────────────────────────────────────────────
+#  Operator: Move -/+
+# ─────────────────────────────────────────────
+
+class SVG_OT_MoveForward(bpy.types.Operator):
+    """Move selected objects in +Y by the offset amount"""
+    bl_idname = "svg_layer.move_forward"
+    bl_label = "Move Forward"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        objects = list(context.selected_objects)
+        if not objects:
+            self.report({'WARNING'}, "No objects selected.")
+            return {'CANCELLED'}
+        step = context.scene.svg_layer_offset
+        for obj in objects:
+            obj.location.y += step
+        return {'FINISHED'}
+
+
+class SVG_OT_MoveBack(bpy.types.Operator):
+    """Move selected objects in -Y by the offset amount"""
+    bl_idname = "svg_layer.move_back"
+    bl_label = "Move Back"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        objects = list(context.selected_objects)
+        if not objects:
+            self.report({'WARNING'}, "No objects selected.")
+            return {'CANCELLED'}
+        step = context.scene.svg_layer_offset
+        for obj in objects:
+            obj.location.y -= step
+        return {'FINISHED'}
+
+
+# ─────────────────────────────────────────────
+#  Operator: Snap
+# ─────────────────────────────────────────────
+
+class SVG_OT_SnapY(bpy.types.Operator):
+    """Snap all selected objects to the highest Y value among them"""
+    bl_idname = "svg_layer.snap_y"
+    bl_label = "Snap"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        objects = list(context.selected_objects)
+        if not objects:
+            self.report({'WARNING'}, "No objects selected.")
+            return {'CANCELLED'}
+        max_y = max(obj.location.y for obj in objects)
+        for obj in objects:
+            obj.location.y = max_y
+        return {'FINISHED'}
+
+
+# ─────────────────────────────────────────────
+#  Operator: Refresh Materials
+# ─────────────────────────────────────────────
+
+class SVG_OT_RefreshMaterials(bpy.types.Operator):
+    """Re-assign materials from the Paper asset library to all objects in the collection or selection"""
+    bl_idname = "svg_layer.refresh_materials"
+    bl_label = "Refresh"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        objects = gather_objects(context)
+
+        if not objects:
+            self.report({'WARNING'}, "No objects found.")
+            return {'CANCELLED'}
+
+        blend_files = find_library_blend_file(context)
+        assigned = 0
+        missing = []
+
+        for obj in objects:
+            if obj.type != 'MESH':
+                continue
+            mat_name = obj.name.split('.')[0]
+            mat = append_material_from_library(context, mat_name, blend_files)
+            if mat is not None:
+                if obj.data.materials:
+                    obj.data.materials[0] = mat
+                else:
+                    obj.data.materials.append(mat)
+                assigned += 1
+            else:
+                missing.append(mat_name)
+
+        if missing:
+            self.report({'WARNING'}, f"Missing materials: {', '.join(set(missing))}")
+        else:
+            self.report({'INFO'}, f"Materials refreshed on {assigned} object(s).")
+
         return {'FINISHED'}
 
 
@@ -197,7 +324,7 @@ class SVG_OT_ApplyLayers(bpy.types.Operator):
 # ─────────────────────────────────────────────
 
 class SVG_PT_LayerPanel(bpy.types.Panel):
-    bl_label = "BB SVG Layer"
+    bl_label = "SVG Layer"
     bl_idname = "SVG_PT_layer_panel"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -208,6 +335,12 @@ class SVG_PT_LayerPanel(bpy.types.Panel):
         box = layout.box()
         box.prop(context.scene, "svg_layer_offset", text="Y Offset per Layer", slider=True)
         box.operator("svg_layer.apply_layers", icon='SHADERFX')
+        box.operator("svg_layer.apply_offset", icon='SORTBYEXT')
+        row = box.row(align=True)
+        row.operator("svg_layer.move_forward", text="-", icon='REMOVE')
+        row.operator("svg_layer.move_back", text="+", icon='ADD')
+        box.operator("svg_layer.snap_y", icon='SNAP_ON')
+        box.operator("svg_layer.refresh_materials", icon='MATERIAL')
 
 
 # ─────────────────────────────────────────────
@@ -216,6 +349,11 @@ class SVG_PT_LayerPanel(bpy.types.Panel):
 
 classes = (
     SVG_OT_ApplyLayers,
+    SVG_OT_ApplyOffset,
+    SVG_OT_MoveForward,
+    SVG_OT_MoveBack,
+    SVG_OT_SnapY,
+    SVG_OT_RefreshMaterials,
     SVG_PT_LayerPanel,
 )
 
