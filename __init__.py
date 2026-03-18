@@ -365,7 +365,7 @@ class SVG_OT_ApplyLayers(bpy.types.Operator):
             for m in [m for m in obj.modifiers if m.type == 'SOLIDIFY']:
                 obj.modifiers.remove(m)
             solidify = obj.modifiers.new(name="Solidify", type='SOLIDIFY')
-            solidify.thickness = 0.003
+            solidify.thickness = 1
             solidify.offset = -1.0
 
             mat_name = obj.name.split('.')[0]
@@ -432,9 +432,8 @@ class SVG_OT_MoveForward(bpy.types.Operator):
         if not objects:
             self.report({'WARNING'}, "No objects selected.")
             return {'CANCELLED'}
-        step = context.scene.svg_layer_offset
         for obj in objects:
-            obj.location.y += step
+            obj.location.y += 1.0
         return {'FINISHED'}
 
 
@@ -449,9 +448,8 @@ class SVG_OT_MoveBack(bpy.types.Operator):
         if not objects:
             self.report({'WARNING'}, "No objects selected.")
             return {'CANCELLED'}
-        step = context.scene.svg_layer_offset
         for obj in objects:
-            obj.location.y -= step
+            obj.location.y -= 1.0
         return {'FINISHED'}
 
 
@@ -519,6 +517,62 @@ class SVG_OT_RefreshMaterials(bpy.types.Operator):
         return {'FINISHED'}
 
 
+
+# ─────────────────────────────────────────────
+#  Operator: Override Material
+# ─────────────────────────────────────────────
+
+class SVG_OT_OverrideMaterial(bpy.types.Operator):
+    """Make a single-user copy of each selected object's material and
+    create a library override so it can be edited independently."""
+    bl_idname = "svg_layer.override_material"
+    bl_label = "Override"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        objects = gather_objects(context)
+        objects = [o for o in objects if o.type == 'MESH']
+
+        if not objects:
+            self.report({'WARNING'}, "No mesh objects found.")
+            return {'CANCELLED'}
+
+        overridden = 0
+        skipped = []
+
+        for obj in objects:
+            if not obj.data.materials or obj.data.materials[0] is None:
+                skipped.append(obj.name)
+                continue
+
+            mat = obj.data.materials[0]
+
+            # Make a single-user copy (unique to this object)
+            new_mat = mat.copy()
+            new_mat.name = obj.name.split('.')[0] + "_override"
+            obj.data.materials[0] = new_mat
+
+            # Library override — only applicable if the material is linked
+            # from a library. If it's a local material, copy is sufficient.
+            if mat.library is not None:
+                try:
+                    override = mat.override_create(remap_local_usages=False)
+                    if override:
+                        new_mat = override
+                        new_mat.name = obj.name.split('.')[0] + "_override"
+                        obj.data.materials[0] = new_mat
+                except Exception as e:
+                    print(f"SVG Layer: Could not create library override for '{mat.name}': {e}")
+
+            overridden += 1
+
+        if skipped:
+            self.report({'WARNING'}, f"Overridden {overridden} material(s). No material on: {', '.join(skipped)}")
+        else:
+            self.report({'INFO'}, f"Overridden {overridden} material(s).")
+
+        return {'FINISHED'}
+
 # ─────────────────────────────────────────────
 #  Operator: Auto Stack
 # ─────────────────────────────────────────────
@@ -531,7 +585,7 @@ class SVG_OT_AutoStack(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        step = context.scene.svg_layer_offset
+        step = 1.0
         threshold = context.scene.svg_layer_area_threshold
 
         parent_col = get_active_collection(context)
@@ -590,7 +644,7 @@ class SVG_OT_AutoStack(bpy.types.Operator):
 # ─────────────────────────────────────────────
 
 class SVG_PT_LayerPanel(bpy.types.Panel):
-    bl_label = "SVG Layer"
+    bl_label = "BB SVG Layers"
     bl_idname = "SVG_PT_layer_panel"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -599,7 +653,6 @@ class SVG_PT_LayerPanel(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         box = layout.box()
-        box.prop(context.scene, "svg_layer_offset", text="Y Offset per Layer", slider=True)
         box.prop(context.scene, "svg_layer_area_threshold", text="Tiny Object Threshold", slider=True)
         box.operator("svg_layer.apply_layers", icon='SHADERFX')
         box.operator("svg_layer.auto_stack", icon='SORTSIZE')
@@ -608,6 +661,7 @@ class SVG_PT_LayerPanel(bpy.types.Panel):
         row.operator("svg_layer.move_back", text="+", icon='ADD')
         box.operator("svg_layer.snap_y", icon='SNAP_ON')
         box.operator("svg_layer.refresh_materials", icon='MATERIAL')
+        box.operator("svg_layer.override_material", icon='LIBRARY_DATA_OVERRIDE')
 
 
 # ─────────────────────────────────────────────
@@ -620,6 +674,7 @@ classes = (
     SVG_OT_MoveBack,
     SVG_OT_SnapY,
     SVG_OT_RefreshMaterials,
+    SVG_OT_OverrideMaterial,
     SVG_OT_AutoStack,
     SVG_PT_LayerPanel,
 )
@@ -641,21 +696,10 @@ def register():
         soft_max=10000.0,
     )
 
-    bpy.types.Scene.svg_layer_offset = bpy.props.FloatProperty(
-        name="Y Offset",
-        description="Per-layer distance along -Y (last object = base, no offset)",
-        default=0.1,
-        min=0.0,
-        max=100.0,
-        step=1,
-        precision=3,
-        soft_min=0.0,
-        soft_max=10.0,
-    )
+
 
 
 def unregister():
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
-    del bpy.types.Scene.svg_layer_offset
     del bpy.types.Scene.svg_layer_area_threshold

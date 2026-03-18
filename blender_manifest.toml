@@ -1,15 +1,9 @@
 schema_version = "1.0.0"
-
-id = "svg_layer"
-version = "2.2.0"
-name = "SVG Layer"
-tagline = "Convert SVG layers: rotate, scale, merge, offset, UV-project and solidify"
+id = "bb_svg_layers"
+version = "2.6.0"
+name = "BB SVG Layers"
+tagline = "Convert SVG layers into paper cutout 3D meshes with auto stacking and asset materials"
 maintainer = "Blender Bob & Claude"
 type = "add-on"
-
 blender_version_min = "4.2.0"
-
 license = ["SPDX:GPL-2.0-or-later"]
-
-[permissions]
-# No special permissions needed
