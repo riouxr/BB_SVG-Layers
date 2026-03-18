@@ -526,7 +526,7 @@ class SVG_OT_OverrideMaterial(bpy.types.Operator):
     """Make a single-user copy of each selected object's material and
     create a library override so it can be edited independently."""
     bl_idname = "svg_layer.override_material"
-    bl_label = "Override"
+    bl_label = "Override Single"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
@@ -570,6 +570,84 @@ class SVG_OT_OverrideMaterial(bpy.types.Operator):
             self.report({'WARNING'}, f"Overridden {overridden} material(s). No material on: {', '.join(skipped)}")
         else:
             self.report({'INFO'}, f"Overridden {overridden} material(s).")
+
+        return {'FINISHED'}
+
+
+# ─────────────────────────────────────────────
+#  Operator: Override Same Material
+# ─────────────────────────────────────────────
+
+class SVG_OT_OverrideMaterialSame(bpy.types.Operator):
+    """For each selected object, make a single-user override of its material
+    and assign that override to ALL objects in the scene sharing the same original material."""
+    bl_idname = "svg_layer.override_material_same"
+    bl_label = "Override Same"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        objects = gather_objects(context)
+        objects = [o for o in objects if o.type == 'MESH']
+
+        if not objects:
+            self.report({'WARNING'}, "No mesh objects found.")
+            return {'CANCELLED'}
+
+        # Build map: original material -> new override material
+        override_map = {}
+        skipped = []
+
+        for obj in objects:
+            if not obj.data.materials or obj.data.materials[0] is None:
+                skipped.append(obj.name)
+                continue
+
+            original_mat = obj.data.materials[0]
+
+            # Skip if we already created an override for this material
+            if original_mat.name in override_map:
+                continue
+
+            # Make a single-user copy
+            new_mat = original_mat.copy()
+            new_mat.name = original_mat.name.split('.')[0] + "_override"
+
+            # Library override if linked
+            if original_mat.library is not None:
+                try:
+                    override = original_mat.override_create(remap_local_usages=False)
+                    if override:
+                        new_mat = override
+                        new_mat.name = original_mat.name.split('.')[0] + "_override"
+                except Exception as e:
+                    print(f"SVG Layer: Could not create library override for '{original_mat.name}': {e}")
+
+            override_map[original_mat.name] = (original_mat, new_mat)
+
+        if not override_map:
+            self.report({'WARNING'}, "No materials to override.")
+            return {'CANCELLED'}
+
+        # Assign the override to ALL objects in the scene sharing the same original material
+        assigned = 0
+        for scene_obj in context.scene.objects:
+            if scene_obj.type != 'MESH':
+                continue
+            if not scene_obj.data.materials:
+                continue
+            for slot_idx, mat in enumerate(scene_obj.data.materials):
+                if mat is None:
+                    continue
+                if mat.name in override_map:
+                    _, new_mat = override_map[mat.name]
+                    scene_obj.data.materials[slot_idx] = new_mat
+                    assigned += 1
+
+        total_overrides = len(override_map)
+        if skipped:
+            self.report({'WARNING'}, f"Created {total_overrides} override(s), assigned to {assigned} slot(s). No material on: {', '.join(skipped)}")
+        else:
+            self.report({'INFO'}, f"Created {total_overrides} override(s), assigned to {assigned} object slot(s).")
 
         return {'FINISHED'}
 
@@ -662,6 +740,7 @@ class SVG_PT_LayerPanel(bpy.types.Panel):
         box.operator("svg_layer.snap_y", icon='SNAP_ON')
         box.operator("svg_layer.refresh_materials", icon='MATERIAL')
         box.operator("svg_layer.override_material", icon='LIBRARY_DATA_OVERRIDE')
+        box.operator("svg_layer.override_material_same", icon='LIBRARY_DATA_OVERRIDE')
 
 
 # ─────────────────────────────────────────────
@@ -675,6 +754,7 @@ classes = (
     SVG_OT_SnapY,
     SVG_OT_RefreshMaterials,
     SVG_OT_OverrideMaterial,
+    SVG_OT_OverrideMaterialSame,
     SVG_OT_AutoStack,
     SVG_PT_LayerPanel,
 )

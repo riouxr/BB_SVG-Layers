@@ -65,7 +65,7 @@ Stacks all objects intelligently using a **greedy layer-packing algorithm**, pro
 **Algorithm:**
 1. Sort objects by surface area — largest first
 2. Objects below the **Tiny Object Threshold** are set aside and placed in the frontmost layer of their group
-3. Each remaining object is placed in the earliest layer where it doesn't overlap any object already there (overlap detected using the **Separating Axis Theorem** on XZ-plane polygons, with a bounding box pre-check for speed)
+3. Each remaining object is placed in the earliest layer where it doesn't overlap anything already there (overlap detected using the **Separating Axis Theorem** on XZ-plane polygons, with a bounding box pre-check for speed)
 4. Collections are processed in **outliner order** — reorder them in the outliner before running Auto Stack to control the BG → character → FG depth order
 5. Y offset between every layer is `1` unit
 
@@ -82,8 +82,11 @@ Snaps all selected objects to the **highest Y value** among them — useful for 
 #### Refresh
 Re-assigns materials from the **Paper** asset library to all objects in the active collection or selection, without touching geometry. Useful after renaming objects or adding new materials to the library.
 
-#### Override
-Makes a **single-user copy** of the assigned material for each object in the active collection or selection, then creates a **library override** so it can be edited independently without affecting other objects sharing the same material. The overridden material is named `<prefix>_override` (e.g. `Wes_body_override`).
+#### Override Single
+Makes a **single-user copy** of the assigned material for each selected object, then creates a **library override** so it can be edited independently without affecting other objects. The overridden material is named `<prefix>_override` (e.g. `Wes_body_override`).
+
+#### Override Same
+Same as Override Single, but after creating the override it **reassigns it to every object in the scene** that was using the same original material. Use this when multiple objects share one material and you want them all to switch to the same editable override in one click.
 
 ---
 
@@ -130,7 +133,7 @@ For multi-character scenes, name your SVG layers with prefixes:
 3. Click **Apply & Sort** — geometry is processed and objects are sorted into sub-collections by prefix
 4. Reorder collections in the outliner if needed (BG → characters → FG)
 5. Click **Auto Stack** — objects are stacked by area within each collection, with Y offsets chaining between collections
-6. Fine-tune with **− / +**, **Snap**, **Refresh**, and **Override** as needed
+6. Fine-tune with **− / +**, **Snap**, **Refresh**, **Override Single**, and **Override Same** as needed
 
 ---
 
