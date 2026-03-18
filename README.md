@@ -48,9 +48,10 @@ Steps performed on each object:
 3. **Convert curves to mesh** — handles 2D curves before transforms are applied
 4. **Apply all transforms** — bakes location, rotation and scale
 5. **Merge by Distance** — cleans up duplicate vertices from curve conversion
-6. **UV projection from Y** — maps UVs onto a 1920×1920 px canvas (`U = X / 1920`, `V = Z / 1920`)
-7. **Solidify modifier** — adds thickness of `1`
-8. **Assign material** — appends and assigns the matching material from the **Paper** asset library by name prefix (e.g. object `Wes_body.002` → material `Wes_body`)
+6. **Solidify modifier** — adds thickness of `1`, then immediately applied
+7. **Offset back faces** — vertices on the back face (identified by Y position above the mesh midpoint) are moved `-2` on X and `+2` on Z, giving the cutout a characteristic paper-craft lean
+8. **UV projection from Y** — front faces are mapped onto a 1920×1920 px canvas (`U = X / 1920`, `V = Z / 1920`); back and side faces are pinned to `(0, 0)` to avoid atlas stretching
+9. **Assign material** — appends and assigns the matching material from the **Paper** asset library by name prefix (e.g. object `Wes_body.002` → material `Wes_body`)
 
 After processing, objects are moved into sub-collections under the active collection, grouped by their name prefix:
 - `BG_` objects → **BG** collection

@@ -360,13 +360,50 @@ class SVG_OT_ApplyLayers(bpy.types.Operator):
                 bpy.ops.mesh.select_all(action='SELECT')
                 bpy.ops.mesh.remove_doubles(threshold=0.0001)
                 bpy.ops.object.mode_set(mode='OBJECT')
-                apply_uv_projection_y(obj)
 
             for m in [m for m in obj.modifiers if m.type == 'SOLIDIFY']:
                 obj.modifiers.remove(m)
             solidify = obj.modifiers.new(name="Solidify", type='SOLIDIFY')
             solidify.thickness = 1
             solidify.offset = -1.0
+            bpy.ops.object.modifier_apply(modifier="Solidify")
+
+            # Move back face vertices -2 X, +2 Z
+            # Since all verts are shared between front/back on a flat mesh,
+            # we identify back verts by their Y position (they are offset ~1 unit in Y)
+            if obj.type == 'MESH':
+                mesh = obj.data
+                # Find the Y midpoint between front and back
+                all_y = [v.co.y for v in mesh.vertices]
+                mid_y = (min(all_y) + max(all_y)) / 2.0
+                print(f"\n[{obj.name}] Y range: {min(all_y):.3f} to {max(all_y):.3f}, mid: {mid_y:.3f}")
+                # Verts with Y above midpoint are the back face verts
+                back_verts = [v for v in mesh.vertices if v.co.y > mid_y]
+                print(f"[{obj.name}] back verts: {len(back_verts)} / {len(mesh.vertices)}")
+                if back_verts:
+                    print(f"[{obj.name}] BEFORE: x={back_verts[0].co.x:.2f} z={back_verts[0].co.z:.2f}")
+                for v in back_verts:
+                    v.co.x -= 2
+                    v.co.z += 2
+                mesh.update()
+                if back_verts:
+                    print(f"[{obj.name}] AFTER:  x={back_verts[0].co.x:.2f} z={back_verts[0].co.z:.2f}")
+
+            # UV projection from Y axis — front faces only, back/side pinned to (0,0)
+            if obj.type == 'MESH':
+                mesh = obj.data
+                if not mesh.uv_layers:
+                    mesh.uv_layers.new(name="UVMap")
+                uv_layer = mesh.uv_layers.active
+                canvas = 1920.0
+                for poly in mesh.polygons:
+                    for loop_idx in poly.loop_indices:
+                        loop = mesh.loops[loop_idx]
+                        vert = mesh.vertices[loop.vertex_index]
+                        if poly.normal.y < -0.5:
+                            uv_layer.data[loop_idx].uv = (vert.co.x / canvas, vert.co.z / canvas)
+                        else:
+                            uv_layer.data[loop_idx].uv = (0.0, 0.0)
 
             mat_name = obj.name.split('.')[0]
             mat = append_material_from_library(context, mat_name, blend_files)
