@@ -150,4 +150,4 @@ svg_layer/
 
 ## License
 
-GPL-2.0-or-later — see [Blender's extension licensing guidelines](https://extensions.blender.org/about/licenses/).
+GPL-3.0-or-later
