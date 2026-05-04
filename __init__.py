@@ -593,8 +593,131 @@ class SVG_OT_ApplyLayers(bpy.types.Operator):
 #  Operator: Move -/+
 # ─────────────────────────────────────────────
 
+def _get_rv3d(context):
+    """Return the RegionView3D of the active 3D viewport, or None."""
+    rv3d = getattr(context, "region_data", None)
+    if rv3d is None:
+        space = getattr(context, "space_data", None)
+        if space is not None and space.type == 'VIEW_3D':
+            rv3d = space.region_3d
+    if rv3d is None:
+        screen = getattr(context, "screen", None)
+        if screen is not None:
+            for area in screen.areas:
+                if area.type == 'VIEW_3D':
+                    rv3d = area.spaces.active.region_3d
+                    break
+    return rv3d
+
+
+def _get_view_forward_world(context):
+    """Return a unit vector in world space pointing in the direction the viewer
+    is currently looking, based on the active 3D viewport.
+    Returns None if no 3D view can be located."""
+    rv3d = _get_rv3d(context)
+    if rv3d is None:
+        return None
+    # In view space, the camera looks along -Z.
+    return (rv3d.view_rotation @ mathutils.Vector((0.0, 0.0, -1.0))).normalized()
+
+
+def _is_orthographic(context):
+    """Return True when the active viewport is in orthographic (or any non-perspective) mode."""
+    rv3d = _get_rv3d(context)
+    if rv3d is None:
+        return False
+    return rv3d.view_perspective == 'ORTHO'
+
+
+def _dominant_ortho_axis(view_fwd_world):
+    """Return the world-space unit vector of the axis most aligned with view_fwd_world.
+    For a standard front-ortho view (looking along -Y) this returns (0, -1, 0)."""
+    ax = abs(view_fwd_world.x)
+    ay = abs(view_fwd_world.y)
+    az = abs(view_fwd_world.z)
+    if ax >= ay and ax >= az:
+        return mathutils.Vector((1.0 if view_fwd_world.x >= 0 else -1.0, 0.0, 0.0))
+    elif ay >= ax and ay >= az:
+        return mathutils.Vector((0.0, 1.0 if view_fwd_world.y >= 0 else -1.0, 0.0))
+    else:
+        return mathutils.Vector((0.0, 0.0, 1.0 if view_fwd_world.z >= 0 else -1.0))
+
+
+def _move_obj_ortho(obj, axis_world, delta):
+    """Translate all vertices of obj by delta along axis_world (world space).
+    The object's origin (location) is NOT moved — only vertex data changes."""
+    # Convert the world-space translation into local object space
+    local_delta = obj.matrix_world.to_3x3().inverted() @ (axis_world * delta)
+    for v in obj.data.vertices:
+        v.co += local_delta
+    obj.data.update()
+
+
+def _get_camera_world_location(context):
+    """Return the world-space position of the active camera, or the viewport
+    eye position as a fallback."""
+    cam = context.scene.camera
+    if cam is not None:
+        return cam.matrix_world.to_translation()
+    rv3d = _get_rv3d(context)
+    if rv3d is not None:
+        return rv3d.view_matrix.inverted().to_translation()
+    return None
+
+
+def _move_obj_perspective(obj, cam_world_pos, view_fwd_world, step):
+    """Move obj along the view ray by *step* world units while preserving its
+    apparent angular size as seen from cam_world_pos.
+
+    Strategy:
+      1. Convert cam_world_pos into the object's local space.
+      2. Temporarily shift all vertices so the pivot is at the camera.
+      3. Scale vertices uniformly by (depth + step) / depth — pure radial
+         scale around the camera, angular size is conserved.
+      4. Shift vertices back to restore the real origin position.
+    """
+    mw = obj.matrix_world
+    mw_inv = mw.inverted()
+
+    # Camera in local object space (accounts for object location/rotation/scale).
+    cam_local = mw_inv @ cam_world_pos
+
+    # Step 1: shift so pivot is at the camera.
+    for v in obj.data.vertices:
+        v.co -= cam_local
+
+    # Depth: signed distance from camera to mesh centre along the view ray.
+    center_shifted = sum(
+        (mathutils.Vector(c) for c in obj.bound_box),
+        mathutils.Vector(),
+    ) / 8.0 - cam_local
+    # Only rotation+scale needed to get the world-space direction.
+    center_world_dir = mw.to_3x3() @ center_shifted
+    depth = center_world_dir.dot(view_fwd_world)
+
+    if abs(depth) < 1e-4:
+        for v in obj.data.vertices:
+            v.co += cam_local
+        obj.data.update()
+        return
+
+    factor = (depth + step) / depth
+
+    # Step 2: radial scale around the camera pivot.
+    for v in obj.data.vertices:
+        v.co *= factor
+
+    # Step 3: restore the real origin.
+    for v in obj.data.vertices:
+        v.co += cam_local
+
+    obj.data.update()
+
+
 class SVG_OT_MoveForward(bpy.types.Operator):
-    """Move selected objects in +Y by the offset amount"""
+    """Move selected objects away from the viewer.
+    Orthographic view: pure translation along the view axis.
+    Camera / perspective view: scale from world origin so apparent size is preserved."""
     bl_idname = "svg_layer.move_forward"
     bl_label = "Move Forward"
     bl_options = {'REGISTER', 'UNDO'}
@@ -604,24 +727,32 @@ class SVG_OT_MoveForward(bpy.types.Operator):
         if not objects:
             self.report({'WARNING'}, "No objects selected.")
             return {'CANCELLED'}
+        view_fwd = _get_view_forward_world(context)
+        if view_fwd is None:
+            self.report({'WARNING'}, "No 3D viewport found — cannot determine view direction.")
+            return {'CANCELLED'}
         step = context.scene.svg_layer_step
+        ortho = _is_orthographic(context)
+        if not ortho:
+            cam_pos = _get_camera_world_location(context)
+            if cam_pos is None:
+                self.report({'WARNING'}, "Could not find camera position.")
+                return {'CANCELLED'}
         for obj in objects:
             if obj.type != 'MESH':
                 continue
-            # Origin is at the camera. Scale vertices from origin so the mesh
-            # moves in depth while maintaining apparent size from the camera.
-            center_y = sum(mathutils.Vector(c).y for c in obj.bound_box) / 8.0
-            if abs(center_y) < 1e-4:
-                continue
-            factor = (center_y + step) / center_y
-            for v in obj.data.vertices:
-                v.co *= factor
-            obj.data.update()
+            if ortho:
+                axis = _dominant_ortho_axis(view_fwd)
+                _move_obj_ortho(obj, axis, step)
+            else:
+                _move_obj_perspective(obj, cam_pos, view_fwd, step)
         return {'FINISHED'}
 
 
 class SVG_OT_MoveBack(bpy.types.Operator):
-    """Move selected objects in -Y by the offset amount"""
+    """Move selected objects toward the viewer.
+    Orthographic view: pure translation along the view axis.
+    Camera / perspective view: scale from world origin so apparent size is preserved."""
     bl_idname = "svg_layer.move_back"
     bl_label = "Move Back"
     bl_options = {'REGISTER', 'UNDO'}
@@ -631,17 +762,25 @@ class SVG_OT_MoveBack(bpy.types.Operator):
         if not objects:
             self.report({'WARNING'}, "No objects selected.")
             return {'CANCELLED'}
+        view_fwd = _get_view_forward_world(context)
+        if view_fwd is None:
+            self.report({'WARNING'}, "No 3D viewport found — cannot determine view direction.")
+            return {'CANCELLED'}
         step = context.scene.svg_layer_step
+        ortho = _is_orthographic(context)
+        if not ortho:
+            cam_pos = _get_camera_world_location(context)
+            if cam_pos is None:
+                self.report({'WARNING'}, "Could not find camera position.")
+                return {'CANCELLED'}
         for obj in objects:
             if obj.type != 'MESH':
                 continue
-            center_y = sum(mathutils.Vector(c).y for c in obj.bound_box) / 8.0
-            if abs(center_y) < 1e-4:
-                continue
-            factor = (center_y - step) / center_y
-            for v in obj.data.vertices:
-                v.co *= factor
-            obj.data.update()
+            if ortho:
+                axis = _dominant_ortho_axis(view_fwd)
+                _move_obj_ortho(obj, axis, -step)
+            else:
+                _move_obj_perspective(obj, cam_pos, view_fwd, -step)
         return {'FINISHED'}
 
 
@@ -941,6 +1080,9 @@ class SVG_OT_ManualProcess(bpy.types.Operator):
             bpy.ops.object.select_all(action='DESELECT')
             obj.select_set(True)
             context.view_layer.objects.active = obj
+
+            # Apply all pending transforms so geometry operations work in real space
+            bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
 
             # Merge by distance
             bpy.ops.object.mode_set(mode='EDIT')

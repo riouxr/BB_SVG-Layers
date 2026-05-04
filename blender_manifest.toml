@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 id = "bb_svg_layers"
-version = "2.7.0"
+version = "2.8.1"
 name = "BB SVG Layers"
 tagline = "Convert SVG layers into paper cutout 3D meshes with auto stacking and asset materials"
 maintainer = "Blender Bob & Claude"
