@@ -788,16 +788,45 @@ class SVG_OT_MoveBack(bpy.types.Operator):
 #  Operator: Snap
 # ─────────────────────────────────────────────
 
+def _snap_obj_to_world_y(obj, cam_world_pos, target_y):
+    """Scale obj's vertices radially from cam_world_pos so the bbox-centre
+    world Y lands exactly on target_y.  Apparent screen size is preserved."""
+    mw = obj.matrix_world
+    mw_inv = mw.inverted()
+
+    cam_local = mw_inv @ cam_world_pos
+
+    corners_local = [mathutils.Vector(c) for c in obj.bound_box]
+    center_local = sum(corners_local, mathutils.Vector()) / 8.0
+    center_world_y = (mw @ center_local).y
+
+    denom = center_world_y - cam_world_pos.y
+    if abs(denom) < 1e-4:
+        return  # degenerate — camera coincides with mesh plane
+
+    # Exact factor: new_center_y = cam_y + (center_y - cam_y) * factor = target_y
+    factor = (target_y - cam_world_pos.y) / denom
+
+    if abs(factor) < 1e-6:
+        return
+
+    for v in obj.data.vertices:
+        v.co = cam_local + (v.co - cam_local) * factor
+
+    obj.data.update()
+
+
 class SVG_OT_SnapY(bpy.types.Operator):
-    """Snap all selected objects to the highest Y value among them,
-    using world-space bounding box centre. Origin stays fixed (e.g. at camera)."""
+    """Snap all selected objects to the highest Y value among them.
+    Orthographic: pure Y translation (vertex data, origin untouched).
+    Camera / perspective: radial scale from the camera origin so the bbox
+    centre lands at exactly the same world Y while apparent size is preserved."""
     bl_idname = "svg_layer.snap_y"
     bl_label = "Snap"
     bl_options = {'REGISTER', 'UNDO'}
 
     @staticmethod
     def _mesh_world_y(obj):
-        """Return the world-space Y of the object's bounding-box centre."""
         corners = [obj.matrix_world @ mathutils.Vector(c) for c in obj.bound_box]
         return sum(c.y for c in corners) / 8.0
 
@@ -807,20 +836,85 @@ class SVG_OT_SnapY(bpy.types.Operator):
             self.report({'WARNING'}, "No mesh objects selected.")
             return {'CANCELLED'}
 
+        # Single object: flatten all its vertices to their average Y
+        if len(objects) == 1:
+            obj = objects[0]
+            mw = obj.matrix_world
+            mw_inv = mw.inverted()
+            world_ys = [(mw @ v.co).y for v in obj.data.vertices]
+            if not world_ys:
+                return {'FINISHED'}
+            avg_y = sum(world_ys) / len(world_ys)
+            for v in obj.data.vertices:
+                world_co = mw @ v.co
+                world_co.y = avg_y
+                v.co = mw_inv @ world_co
+            obj.data.update()
+            return {'FINISHED'}
+
+        # Multiple objects: snap all to the highest bbox-centre Y
         mesh_ys = {obj: self._mesh_world_y(obj) for obj in objects}
         max_mesh_y = max(mesh_ys.values())
 
-        for obj in objects:
-            delta_y = max_mesh_y - mesh_ys[obj]
-            if abs(delta_y) < 1e-6:
-                continue
-            # Convert world-space Y shift into object local space,
-            # then apply directly to vertex data — origin stays untouched.
-            local_delta = obj.matrix_world.to_3x3().inverted() @ mathutils.Vector((0.0, delta_y, 0.0))
-            for v in obj.data.vertices:
-                v.co += local_delta
-            obj.data.update()
+        if not _is_orthographic(context):
+            cam_pos = _get_camera_world_location(context)
+            if cam_pos is None:
+                self.report({'WARNING'}, "Could not find camera position.")
+                return {'CANCELLED'}
+            for obj in objects:
+                if abs(mesh_ys[obj] - max_mesh_y) < 1e-6:
+                    continue
+                _snap_obj_to_world_y(obj, cam_pos, max_mesh_y)
+        else:
+            for obj in objects:
+                delta_y = max_mesh_y - mesh_ys[obj]
+                if abs(delta_y) < 1e-6:
+                    continue
+                local_delta = obj.matrix_world.to_3x3().inverted() @ mathutils.Vector((0.0, delta_y, 0.0))
+                for v in obj.data.vertices:
+                    v.co += local_delta
+                obj.data.update()
 
+        return {'FINISHED'}
+
+
+class SVG_OT_SnapToZero(bpy.types.Operator):
+    """Snap all selected objects so their bbox-centre sits at Y=0.
+    Orthographic: pure Y translation.
+    Camera / perspective: radial scale from the camera origin."""
+    bl_idname = "svg_layer.snap_to_zero"
+    bl_label = "Snap to 0"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @staticmethod
+    def _mesh_world_y(obj):
+        corners = [obj.matrix_world @ mathutils.Vector(c) for c in obj.bound_box]
+        return sum(c.y for c in corners) / 8.0
+
+    def execute(self, context):
+        objects = [o for o in context.selected_objects if o.type == 'MESH']
+        if not objects:
+            self.report({'WARNING'}, "No mesh objects selected.")
+            return {'CANCELLED'}
+
+        if not _is_orthographic(context):
+            cam_pos = _get_camera_world_location(context)
+            if cam_pos is None:
+                self.report({'WARNING'}, "Could not find camera position.")
+                return {'CANCELLED'}
+            for obj in objects:
+                _snap_obj_to_world_y(obj, cam_pos, 0.0)
+        else:
+            for obj in objects:
+                delta_y = -self._mesh_world_y(obj)
+                if abs(delta_y) < 1e-6:
+                    continue
+                local_delta = obj.matrix_world.to_3x3().inverted() @ mathutils.Vector((0.0, delta_y, 0.0))
+                for v in obj.data.vertices:
+                    v.co += local_delta
+                obj.data.update()
+
+        self.report({'INFO'}, f"Snapped {len(objects)} object(s) to Y=0.")
         return {'FINISHED'}
 
 
@@ -829,11 +923,38 @@ class SVG_OT_SnapY(bpy.types.Operator):
 # ─────────────────────────────────────────────
 
 class SVG_OT_OverrideMaterial(bpy.types.Operator):
-    """Make a single-user copy of each selected object's material so it can be
-    edited independently."""
+    """Copy each selected object's material and make it fully local —
+    no library links remain."""
     bl_idname = "svg_layer.override_material"
     bl_label = "Override Single"
     bl_options = {'REGISTER', 'UNDO'}
+
+    @staticmethod
+    def _make_local_copy(mat, new_name):
+        """Return a fully local copy of mat with all library links removed."""
+        new_mat = mat.copy()
+        new_mat.name = new_name
+        # Make the datablock itself local (breaks the library reference)
+        if new_mat.library is not None:
+            new_mat.make_local()
+        # Remove override_library so Blender stops treating it as linked
+        if getattr(new_mat, "override_library", None) is not None:
+            try:
+                new_mat.override_library.reset()
+            except Exception:
+                pass
+        # Detach every node's id links so textures / node-groups become local
+        if new_mat.use_nodes and new_mat.node_tree:
+            for node in new_mat.node_tree.nodes:
+                if hasattr(node, "image") and node.image is not None:
+                    if node.image.library is not None:
+                        node.image = node.image.copy()
+                        node.image.make_local()
+                if hasattr(node, "node_tree") and node.node_tree is not None:
+                    if node.node_tree.library is not None:
+                        node.node_tree = node.node_tree.copy()
+                        node.node_tree.make_local()
+        return new_mat
 
     def execute(self, context):
         objects = gather_objects(context)
@@ -851,25 +972,16 @@ class SVG_OT_OverrideMaterial(bpy.types.Operator):
                 skipped.append(obj.name)
                 continue
             mat = obj.data.materials[0]
-            new_mat = mat.copy()
-            new_mat.name = obj.name.split('.')[0] + "_override"
+            new_name = obj.name.split('.')[0] + "_local"
+            new_mat = self._make_local_copy(mat, new_name)
             obj.data.materials[0] = new_mat
-            if mat.library is not None:
-                try:
-                    override = mat.override_create(remap_local_usages=False)
-                    if override:
-                        new_mat = override
-                        new_mat.name = obj.name.split('.')[0] + "_override"
-                        obj.data.materials[0] = new_mat
-                except Exception as e:
-                    print(f"SVG Layer: Could not create library override for '{mat.name}': {e}")
             overridden += 1
 
         if skipped:
             self.report({'WARNING'},
-                f"Overridden {overridden} material(s). No material on: {', '.join(skipped)}")
+                f"Localised {overridden} material(s). No material on: {', '.join(skipped)}")
         else:
-            self.report({'INFO'}, f"Overridden {overridden} material(s).")
+            self.report({'INFO'}, f"Localised {overridden} material(s).")
 
         return {'FINISHED'}
 
@@ -879,8 +991,8 @@ class SVG_OT_OverrideMaterial(bpy.types.Operator):
 # ─────────────────────────────────────────────
 
 class SVG_OT_OverrideMaterialSame(bpy.types.Operator):
-    """For each selected object, make a single-user override and assign that override
-    to ALL objects in the scene sharing the same original material."""
+    """For each selected object, make a fully local copy of its material and
+    assign that local copy to ALL objects in the scene sharing the same original."""
     bl_idname = "svg_layer.override_material_same"
     bl_label = "Override Same"
     bl_options = {'REGISTER', 'UNDO'}
@@ -893,7 +1005,7 @@ class SVG_OT_OverrideMaterialSame(bpy.types.Operator):
             self.report({'WARNING'}, "No mesh objects found.")
             return {'CANCELLED'}
 
-        override_map = {}
+        local_map = {}   # original mat name -> new local mat
         skipped = []
 
         for obj in objects:
@@ -901,22 +1013,14 @@ class SVG_OT_OverrideMaterialSame(bpy.types.Operator):
                 skipped.append(obj.name)
                 continue
             original_mat = obj.data.materials[0]
-            if original_mat.name in override_map:
+            if original_mat.name in local_map:
                 continue
-            new_mat = original_mat.copy()
-            new_mat.name = original_mat.name.split('.')[0] + "_override"
-            if original_mat.library is not None:
-                try:
-                    override = original_mat.override_create(remap_local_usages=False)
-                    if override:
-                        new_mat = override
-                        new_mat.name = original_mat.name.split('.')[0] + "_override"
-                except Exception as e:
-                    print(f"SVG Layer: Could not create library override for '{original_mat.name}': {e}")
-            override_map[original_mat.name] = (original_mat, new_mat)
+            new_name = original_mat.name.split('.')[0] + "_local"
+            new_mat = SVG_OT_OverrideMaterial._make_local_copy(original_mat, new_name)
+            local_map[original_mat.name] = new_mat
 
-        if not override_map:
-            self.report({'WARNING'}, "No materials to override.")
+        if not local_map:
+            self.report({'WARNING'}, "No materials to localise.")
             return {'CANCELLED'}
 
         assigned = 0
@@ -924,20 +1028,17 @@ class SVG_OT_OverrideMaterialSame(bpy.types.Operator):
             if scene_obj.type != 'MESH' or not scene_obj.data.materials:
                 continue
             for slot_idx, mat in enumerate(scene_obj.data.materials):
-                if mat is None:
-                    continue
-                if mat.name in override_map:
-                    _, new_mat = override_map[mat.name]
-                    scene_obj.data.materials[slot_idx] = new_mat
+                if mat is not None and mat.name in local_map:
+                    scene_obj.data.materials[slot_idx] = local_map[mat.name]
                     assigned += 1
 
         if skipped:
             self.report({'WARNING'},
-                f"Created {len(override_map)} override(s), assigned to {assigned} slot(s). "
+                f"Localised {len(local_map)} material(s), assigned to {assigned} slot(s). "
                 f"No material on: {', '.join(skipped)}")
         else:
             self.report({'INFO'},
-                f"Created {len(override_map)} override(s), assigned to {assigned} object slot(s).")
+                f"Localised {len(local_map)} material(s), assigned to {assigned} slot(s).")
 
         return {'FINISHED'}
 
@@ -1051,6 +1152,11 @@ class SVG_OT_LoadSVG(bpy.types.Operator):
         bpy.ops.svg_layer.apply_layers(svg_filepath=filepath)
         bpy.ops.svg_layer.auto_stack()
 
+        # Random UV rotation on all newly imported mesh objects
+        for obj in bpy.data.objects:
+            if obj.name not in before and obj.type == 'MESH':
+                _random_rotate_uvs(obj)
+
         self.report({'INFO'},
             f"Loaded {len(new_objects)} object(s) from '{os.path.basename(filepath)}' — {order_msg}.")
         return {'FINISHED'}
@@ -1062,24 +1168,52 @@ class SVG_OT_LoadSVG(bpy.types.Operator):
 
 class SVG_OT_ManualProcess(bpy.types.Operator):
     """Apply solidify, merge vertices, back-face offset and UV projection
-    to selected mesh objects, without touching materials or collections."""
+    to selected mesh/curve objects, without touching materials or collections.
+    Bezier and NURBS curves are converted to mesh first."""
     bl_idname = "svg_layer.manual_process"
     bl_label = "Manual"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        objects = [o for o in context.selected_objects if o.type == 'MESH']
+        objects = [o for o in context.selected_objects if o.type in {'MESH', 'CURVE'}]
         if not objects:
-            self.report({'WARNING'}, "No mesh objects selected.")
+            self.report({'WARNING'}, "No mesh or curve objects selected.")
             return {'CANCELLED'}
 
         if context.object and context.object.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
 
+        # Convert any curve objects (bezier / nurbs) to mesh first.
+        # obj reference stays valid after convert() — it mutates the object in-place.
+        curves_converted = 0
+        mesh_objects = []
+        for obj in objects:
+            if obj.type == 'CURVE':
+                for spline in obj.data.splines:
+                    spline.use_cyclic_u = True
+                obj.data.fill_mode = 'FULL'
+                bpy.ops.object.select_all(action='DESELECT')
+                obj.select_set(True)
+                context.view_layer.objects.active = obj
+                bpy.ops.object.convert(target='MESH')
+                # Safety net: if no faces were created, fill the edge loop in edit mode
+                if len(obj.data.polygons) == 0:
+                    bpy.ops.object.mode_set(mode='EDIT')
+                    bpy.ops.mesh.select_all(action='SELECT')
+                    bpy.ops.mesh.fill()
+                    bpy.ops.object.mode_set(mode='OBJECT')
+                curves_converted += 1
+            mesh_objects.append(obj)  # already MESH or just converted
+        objects = mesh_objects
+
         for obj in objects:
             bpy.ops.object.select_all(action='DESELECT')
             obj.select_set(True)
             context.view_layer.objects.active = obj
+
+            # Make mesh single-user before applying transforms (prevents multi-user error)
+            if obj.data.users > 1:
+                obj.data = obj.data.copy()
 
             # Apply all pending transforms so geometry operations work in real space
             bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
@@ -1128,7 +1262,152 @@ class SVG_OT_ManualProcess(bpy.types.Operator):
         for obj in objects:
             obj.select_set(True)
 
-        self.report({'INFO'}, f"Manual: processed {len(objects)} object(s).")
+        # Random UV rotation — each object gets a different angle
+        for obj in objects:
+            _random_rotate_uvs(obj)
+
+        curve_note = f" ({curves_converted} curve(s) converted)" if curves_converted else ""
+        self.report({'INFO'}, f"Manual: processed {len(objects)} object(s){curve_note}.")
+        return {'FINISHED'}
+
+
+# ─────────────────────────────────────────────
+#  Operator: Randomize + Flatten Y
+# ─────────────────────────────────────────────
+
+class SVG_OT_RandomizeFlatten(bpy.types.Operator):
+    """Randomize vertex positions on selected mesh objects, then flatten
+    all vertices (across all selected objects) to their global average Y."""
+    bl_idname = "svg_layer.randomize_flatten"
+    bl_label = "Randomize"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        objects = [o for o in context.selected_objects if o.type == 'MESH']
+        if not objects:
+            self.report({'WARNING'}, "No mesh objects selected.")
+            return {'CANCELLED'}
+
+        amount = context.scene.svg_layer_randomize_amount
+
+        if context.object and context.object.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        # Randomize all objects first
+        for obj in objects:
+            rng = random.Random()  # seeded from system time — different every call
+            mesh = obj.data
+            for v in mesh.vertices:
+                v.co.x += rng.uniform(-amount, amount)
+                v.co.y += rng.uniform(-amount, amount)
+                v.co.z += rng.uniform(-amount, amount)
+            mesh.update()
+
+        # Compute global average world Y across every vertex of every object
+        total_y = 0.0
+        total_count = 0
+        for obj in objects:
+            mw = obj.matrix_world
+            for v in obj.data.vertices:
+                total_y += (mw @ v.co).y
+                total_count += 1
+
+        if total_count == 0:
+            return {'FINISHED'}
+
+        global_avg_y = total_y / total_count
+
+        # Flatten every vertex to that global average Y (in local space)
+        for obj in objects:
+            mw = obj.matrix_world
+            mw_inv = mw.inverted()
+            for v in obj.data.vertices:
+                world_co = mw @ v.co
+                world_co.y = global_avg_y
+                v.co = mw_inv @ world_co
+            obj.data.update()
+
+        # Restore selection
+        bpy.ops.object.select_all(action='DESELECT')
+        for obj in objects:
+            obj.select_set(True)
+
+        self.report({'INFO'}, f"Randomize+Flatten: processed {len(objects)} object(s).")
+        return {'FINISHED'}
+
+
+# ─────────────────────────────────────────────
+#  UV random rotation helper + operator
+# ─────────────────────────────────────────────
+
+def _random_rotate_uvs(obj, rng=None):
+    """Rotate all UVs of obj around their centroid by a random angle.
+    Each call with a fresh rng (or None → system-seeded) gives a different result."""
+    mesh = obj.data
+    if not mesh.uv_layers:
+        return
+    if rng is None:
+        rng = random.Random()
+
+    uv_layer = mesh.uv_layers.active
+    if uv_layer is None:
+        return
+
+    # Collect all UV coords for this object
+    uvs = [uv_layer.data[li].uv for li in range(len(uv_layer.data))]
+    if not uvs:
+        return
+
+    # Centroid
+    cx = sum(uv.x for uv in uvs) / len(uvs)
+    cy = sum(uv.y for uv in uvs) / len(uvs)
+
+    angle = rng.uniform(0, 2 * math.pi)
+    cos_a = math.cos(angle)
+    sin_a = math.sin(angle)
+
+    for uv in uvs:
+        dx = uv.x - cx
+        dy = uv.y - cy
+        uv.x = cx + cos_a * dx - sin_a * dy
+        uv.y = cy + sin_a * dx + cos_a * dy
+
+
+class SVG_OT_RandomUVR(bpy.types.Operator):
+    """Project UVs from front-face X/Z (same as Manual), then randomly rotate
+    the UVs of each selected mesh object independently."""
+    bl_idname = "svg_layer.random_uv_r"
+    bl_label = "Random UV R"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        objects = [o for o in context.selected_objects if o.type == 'MESH']
+        if not objects:
+            self.report({'WARNING'}, "No mesh objects selected.")
+            return {'CANCELLED'}
+
+        canvas = 1920.0
+        for obj in objects:
+            mesh = obj.data
+            # Ensure a UV layer exists
+            if not mesh.uv_layers:
+                mesh.uv_layers.new(name="UVMap")
+            uv_layer = mesh.uv_layers.active
+            if uv_layer is None:
+                continue
+            # Project UVs: front-facing polys get X/Z coords, back-facing get (0,0)
+            for poly in mesh.polygons:
+                for loop_idx in poly.loop_indices:
+                    loop = mesh.loops[loop_idx]
+                    vert = mesh.vertices[loop.vertex_index]
+                    if poly.normal.y < -0.5:
+                        uv_layer.data[loop_idx].uv = (vert.co.x / canvas, vert.co.z / canvas)
+                    else:
+                        uv_layer.data[loop_idx].uv = (0.0, 0.0)
+            # Random rotation on top of the fresh projection
+            _random_rotate_uvs(obj)
+
+        self.report({'INFO'}, f"UV projected + random rotation applied to {len(objects)} object(s).")
         return {'FINISHED'}
 
 
@@ -1154,10 +1433,16 @@ class SVG_PT_LayerPanel(bpy.types.Panel):
         row.operator("svg_layer.move_forward", text="-", icon='REMOVE')
         row.operator("svg_layer.move_back", text="+", icon='ADD')
         box.operator("svg_layer.snap_y", icon='SNAP_ON')
-        box.operator("svg_layer.override_material", icon='LIBRARY_DATA_OVERRIDE')
-        box.operator("svg_layer.override_material_same", icon='LIBRARY_DATA_OVERRIDE')
+        box.operator("svg_layer.snap_to_zero", icon='SNAP_ON')
         box.separator()
         box.operator("svg_layer.manual_process", icon='MODIFIER')
+        box.operator("svg_layer.random_uv_r", icon='UV')
+        box.separator()
+        box.prop(context.scene, "svg_layer_randomize_amount", text="Amount")
+        box.operator("svg_layer.randomize_flatten", icon='RNDCURVE')
+        box.separator()
+        box.operator("svg_layer.override_material", icon='LIBRARY_DATA_OVERRIDE')
+        box.operator("svg_layer.override_material_same", icon='LIBRARY_DATA_OVERRIDE')
 
 
 # ─────────────────────────────────────────────
@@ -1170,10 +1455,13 @@ classes = (
     SVG_OT_MoveForward,
     SVG_OT_MoveBack,
     SVG_OT_SnapY,
+    SVG_OT_SnapToZero,
     SVG_OT_OverrideMaterial,
     SVG_OT_OverrideMaterialSame,
     SVG_OT_AutoStack,
     SVG_OT_ManualProcess,
+    SVG_OT_RandomizeFlatten,
+    SVG_OT_RandomUVR,
     SVG_PT_LayerPanel,
 )
 
@@ -1192,8 +1480,19 @@ def register():
         precision=2,
     )
 
+    bpy.types.Scene.svg_layer_randomize_amount = bpy.props.FloatProperty(
+        name="Randomize Amount",
+        description="Vertex randomize offset applied before Y-flatten",
+        default=2.0,
+        min=0.0,
+        soft_max=50.0,
+        step=10,
+        precision=2,
+    )
+
 
 def unregister():
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
     del bpy.types.Scene.svg_layer_step
+    del bpy.types.Scene.svg_layer_randomize_amount
