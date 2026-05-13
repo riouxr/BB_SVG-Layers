@@ -218,6 +218,34 @@ def _ensure_catalog(lib_root, catalog_name):
     return uid
 
 
+def _load_master_from_library():
+    """Try to load the 'Master' material from the Paper asset library if it
+    is not already present in the current file.  Returns the material or None."""
+    if bpy.data.materials.get("Master"):
+        return bpy.data.materials["Master"]
+
+    lib_root = get_user_library_path()
+    if lib_root is None:
+        return None
+
+    # Walk every .blend inside the library looking for a material named Master
+    for root, dirs, files in os.walk(lib_root):
+        for fname in files:
+            if not fname.lower().endswith(".blend"):
+                continue
+            blend_path = os.path.join(root, fname)
+            # Peek at the material names without fully loading the file
+            with bpy.data.libraries.load(blend_path, link=False) as (src, dst):
+                if "Master" in src.materials:
+                    dst.materials = ["Master"]
+            # dst.materials is populated after the with-block closes
+            mat = bpy.data.materials.get("Master")
+            if mat:
+                return mat
+
+    return None
+
+
 def mark_and_export_materials(materials, catalog_name="Paper"):
     """Mark materials as assets and write them into the Paper catalog in the User Library."""
     lib_root = get_user_library_path()
@@ -319,42 +347,208 @@ def group_objects_by_prefix(objects):
 #  Layer packing helpers
 # ─────────────────────────────────────────────
 
-def xz_bbox(obj):
-    mesh = obj.data
-    mat = obj.matrix_world
-    xs = [(mat @ mesh.vertices[v].co).x for v in range(len(mesh.vertices))]
-    zs = [(mat @ mesh.vertices[v].co).z for v in range(len(mesh.vertices))]
-    return min(xs), max(xs), min(zs), max(zs)
-
-
-def xz_bboxes_overlap(a, b):
-    ax0, ax1, az0, az1 = a
-    bx0, bx1, bz0, bz1 = b
-    return ax1 > bx0 and bx1 > ax0 and az1 > bz0 and bz1 > az0
-
-
 def pack_layers(ordered_objects, step):
+    """Stack SVG layers along world Y (front-ortho view_fwd).
+    Delegates to pack_layers_view with preserve_order=True so the SVG
+    document order is respected rather than re-sorting by depth.
+    Uses face-polygon narrowphase overlap — same as Auto Stack — so
+    concave shapes (holes, U-shapes, etc.) are handled correctly.
     """
-    ordered_objects: back-to-front (index 0 = furthest back).
-    Index 0 -> Y=0. Each next object goes more negative only when it
-    overlaps something already placed.
+    # SVG imports arrive as a front-view ortho scene: Y is depth,
+    # XZ is the screen plane.
+    view_fwd = mathutils.Vector((0.0, 1.0, 0.0))
+    pack_layers_view(ordered_objects, step, view_fwd,
+                     cam_pos=None, preserve_order=True)
+
+
+def _vert_avg_depth(obj, view_fwd):
+    """Average world-space vertex position projected onto view_fwd."""
+    verts = obj.data.vertices
+    if not verts:
+        return 0.0
+    total = sum((obj.matrix_world @ v.co).dot(view_fwd) for v in verts)
+    return total / len(verts)
+
+
+def _obj_view_info(obj, view_fwd, u, v_ax):
+    """Return (depth, screen_bbox, screen_polys) for *obj*.
+
+    depth        - vertex-average depth along view_fwd.
+    screen_bbox  - (u_min, u_max, v_min, v_max) fast broadphase reject box.
+    screen_polys - list of 2-D face polygons [(u,v), ...] for narrowphase.
+                   Only actual face geometry — concave holes are represented
+                   faithfully because we iterate faces, not the convex hull.
     """
-    if not ordered_objects:
-        return
-    bboxes = [xz_bbox(o) for o in ordered_objects]
-    placed_y = [None] * len(ordered_objects)
-    for i in range(len(ordered_objects)):
-        obj = ordered_objects[i]
-        bbox_i = bboxes[i]
-        blocking_y = None
-        for j in range(i):
-            if xz_bboxes_overlap(bbox_i, bboxes[j]):
-                y_j = placed_y[j]
-                if blocking_y is None or y_j < blocking_y:
-                    blocking_y = y_j
-        obj.location.y = 0.0 if blocking_y is None else blocking_y - step
-        placed_y[i] = obj.location.y
-        print(f"SVG Layer: '{obj.name}' -> Y={obj.location.y:.3f}")
+    mesh = obj.data
+    world_verts = [obj.matrix_world @ v.co for v in mesh.vertices]
+    if not world_verts:
+        return 0.0, (0.0, 0.0, 0.0, 0.0), []
+
+    depths = [wv.dot(view_fwd) for wv in world_verts]
+    us2d   = [wv.dot(u)        for wv in world_verts]
+    vs2d   = [wv.dot(v_ax)     for wv in world_verts]
+
+    screen_polys = [
+        [(us2d[vi], vs2d[vi]) for vi in face.vertices]
+        for face in mesh.polygons
+    ]
+    bbox = (min(us2d), max(us2d), min(vs2d), max(vs2d))
+    return sum(depths) / len(depths), bbox, screen_polys
+
+
+def _screen_bboxes_overlap(a, b):
+    au0, au1, av0, av1 = a
+    bu0, bu1, bv0, bv1 = b
+    return au1 > bu0 and bu1 > au0 and av1 > bv0 and bv1 > av0
+
+
+def _pt_in_poly_2d(pt, poly):
+    """Ray-casting point-in-polygon test for a 2-D polygon."""
+    x, y  = pt
+    n     = len(poly)
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, yi = poly[i]
+        xj, yj = poly[j]
+        if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def _segs_intersect_2d(p1, p2, p3, p4):
+    """True if segment p1-p2 properly intersects segment p3-p4."""
+    def cross(o, a, b):
+        return (a[0]-o[0])*(b[1]-o[1]) - (a[1]-o[1])*(b[0]-o[0])
+    d1 = cross(p3, p4, p1)
+    d2 = cross(p3, p4, p2)
+    d3 = cross(p1, p2, p3)
+    d4 = cross(p1, p2, p4)
+    if ((d1 > 0 and d2 < 0) or (d1 < 0 and d2 > 0)) and        ((d3 > 0 and d4 < 0) or (d3 < 0 and d4 > 0)):
+        return True
+    return False
+
+
+def _polys_overlap_2d(pa, pb):
+    """True if 2-D polygon pa and pb overlap (vertex-in-poly or edge cross)."""
+    # Any vertex of pa inside pb?
+    for pt in pa:
+        if _pt_in_poly_2d(pt, pb):
+            return True
+    # Any vertex of pb inside pa?
+    for pt in pb:
+        if _pt_in_poly_2d(pt, pa):
+            return True
+    # Any edge pair crossing?
+    na, nb = len(pa), len(pb)
+    for i in range(na):
+        for j in range(nb):
+            if _segs_intersect_2d(pa[i], pa[(i+1)%na], pb[j], pb[(j+1)%nb]):
+                return True
+    return False
+
+
+def _meshes_screen_overlap(bbox_a, polys_a, bbox_b, polys_b):
+    """True if any face of mesh A overlaps any face of mesh B in screen space.
+    Uses bounding-box broadphase to skip pairs that can't possibly overlap,
+    then per-face polygon intersection for the narrowphase.  This correctly
+    handles concave shapes — a U-shape's hole is not covered by any face,
+    so objects sitting inside the hole are not flagged as overlapping.
+    """
+    # Broadphase: if overall bboxes don't touch, nothing overlaps.
+    if not _screen_bboxes_overlap(bbox_a, bbox_b):
+        return False
+    # Narrowphase: face-level polygon intersection.
+    for pa in polys_a:
+        for pb in polys_b:
+            if _polys_overlap_2d(pa, pb):
+                return True
+    return False
+
+
+def pack_layers_view(objects, step, view_fwd, cam_pos=None, preserve_order=False):
+    """Stack objects along an arbitrary view axis with face-polygon overlap detection.
+
+    preserve_order=True  : use objects as-is (SVG document order from load_svg).
+                           First object gets depth 0, others step back only on overlap.
+    preserve_order=False : sort furthest-first by current vertex-average depth
+                           (Auto Stack on selected).
+
+    cam_pos=None  : ortho — translate obj.location along view_fwd.
+    cam_pos=Vector: perspective — radially scale vertices from camera origin so
+                    apparent size is preserved (same as +/- buttons).
+
+    Overlap is tested face-by-face in 2-D screen space so concave shapes
+    (U-shapes, holes) are handled correctly — the hole is not covered by any
+    face, so objects sitting inside it are not flagged as overlapping.
+
+    Returns the number of passes taken to converge.
+    """
+    if not objects:
+        return 0
+
+    ref = mathutils.Vector((0.0, 0.0, 1.0))
+    if abs(view_fwd.dot(ref)) > 0.9:
+        ref = mathutils.Vector((1.0, 0.0, 0.0))
+    u    = view_fwd.cross(ref).normalized()
+    v_ax = view_fwd.cross(u).normalized()
+
+    max_passes = 20
+    for iteration in range(max_passes):
+        infos = []
+        for obj in objects:
+            depth, sbbox, spolys = _obj_view_info(obj, view_fwd, u, v_ax)
+            infos.append({'obj': obj, 'depth': depth, 'sbbox': sbbox, 'spolys': spolys})
+
+        if not preserve_order:
+            infos.sort(key=lambda x: x['depth'], reverse=True)
+
+        placed    = []  # list of (placed_depth, sbbox, spolys)
+        any_moved = False
+        base_depth = 0.0 if preserve_order else None
+
+        for info in infos:
+            obj           = info['obj']
+            sbbox         = info['sbbox']
+            spolys        = info['spolys']
+            current_depth = info['depth']
+
+            blocking = [d for d, bb, bp in placed
+                        if _meshes_screen_overlap(sbbox, spolys, bb, bp)]
+
+            if preserve_order:
+                # SVG mode: first object anchors at 0, each overlapping layer
+                # steps back by one step (negative Y = further from camera).
+                if not placed:
+                    target_depth = 0.0
+                elif blocking:
+                    target_depth = min(blocking) - step
+                else:
+                    target_depth = 0.0
+            else:
+                # Auto Stack mode: stay put unless too close to a blocker.
+                target_depth = min(blocking) - step if blocking else current_depth
+
+            delta = target_depth - current_depth
+
+            if abs(delta) > 1e-4:
+                any_moved = True
+                if cam_pos is not None:
+                    _move_obj_perspective(obj, cam_pos, view_fwd, delta)
+                else:
+                    _move_obj_ortho(obj, view_fwd, delta)
+                depth_after = _vert_avg_depth(obj, view_fwd)
+                print(f"  [pass {iteration+1}] {obj.name}: {current_depth:.3f} -> {depth_after:.3f}  target={target_depth:.3f}")
+
+            placed.append((target_depth, sbbox, spolys))
+
+        if not any_moved:
+            print(f"[Auto Stack] converged in {iteration+1} pass(es)")
+            return iteration + 1
+
+    print(f"[Auto Stack] did not converge in {max_passes} passes")
+    return max_passes
 
 
 # ─────────────────────────────────────────────
@@ -453,9 +647,11 @@ class SVG_OT_ApplyLayers(bpy.types.Operator):
         if context.object and context.object.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
 
-        master_mat = bpy.data.materials.get("Master")
+        master_mat = _load_master_from_library()
         if master_mat is None:
-            self.report({'ERROR'}, "No material named 'Master' found.")
+            self.report({'ERROR'},
+                "No 'Master' material found locally or in any asset library. "
+                "Open the Paper library in the Asset Browser and append 'Master' manually.")
             return {'CANCELLED'}
 
         # Parse fill colors from SVG
@@ -1066,6 +1262,41 @@ class SVG_OT_AutoStack(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class SVG_OT_AutoStackSelected(bpy.types.Operator):
+    """Re-stack selected mesh objects from the camera / viewport view direction.
+    Objects are sorted by their depth along the view axis and separated by
+    Layer Step wherever their screen-space vertex footprints overlap."""
+    bl_idname = "svg_layer.auto_stack_selected"
+    bl_label = "Auto Stack"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        objects = [o for o in context.selected_objects if o.type == 'MESH']
+        self.report({'INFO'}, f"Auto Stack: found {len(objects)} mesh object(s).")
+        if not objects:
+            self.report({'WARNING'}, "No mesh objects selected.")
+            return {'CANCELLED'}
+
+        view_fwd = _get_view_forward_world(context)
+        self.report({'INFO'}, f"view_fwd={view_fwd}")
+        if view_fwd is None:
+            self.report({'WARNING'}, "No 3D viewport found.")
+            return {'CANCELLED'}
+
+        cam_pos = _get_camera_world_location(context)
+        self.report({'INFO'}, f"cam_pos={cam_pos}, ortho={_is_orthographic(context)}")
+        if cam_pos is None and not _is_orthographic(context):
+            self.report({'WARNING'}, "Could not find camera position.")
+            return {'CANCELLED'}
+
+        step = context.scene.svg_layer_step
+        passes = pack_layers_view(objects, step, view_fwd, cam_pos=cam_pos)
+
+        self.report({'INFO'},
+            f"Auto Stack: {len(objects)} object(s), {passes} pass(es), step={step:.2f}.")
+        return {'FINISHED'}
+
+
 # ─────────────────────────────────────────────
 #  Operator: Load SVG (order-aware import)
 # ─────────────────────────────────────────────
@@ -1097,9 +1328,11 @@ class SVG_OT_LoadSVG(bpy.types.Operator):
             self.report({'ERROR'}, f"File not found: {filepath}")
             return {'CANCELLED'}
 
-        if bpy.data.materials.get("Master") is None:
-            self.report({'ERROR'}, "No material named 'Master' found. "
-                        "Please create a 'Master' material before importing.")
+        master_mat = _load_master_from_library()
+        if master_mat is None:
+            self.report({'ERROR'},
+                "No 'Master' material found locally or in any asset library. "
+                "Open the Paper library in the Asset Browser and append 'Master' manually.")
             return {'CANCELLED'}
 
         svg_order = read_svg_layer_order(filepath)
@@ -1159,6 +1392,109 @@ class SVG_OT_LoadSVG(bpy.types.Operator):
 
         self.report({'INFO'},
             f"Loaded {len(new_objects)} object(s) from '{os.path.basename(filepath)}' — {order_msg}.")
+        return {'FINISHED'}
+
+
+# ─────────────────────────────────────────────
+#  Operator: Hole Boolean
+# ─────────────────────────────────────────────
+
+def _mesh_avg_y(obj):
+    """Return the average world Y of an object's vertices."""
+    verts = obj.data.vertices
+    if not verts:
+        return 0.0
+    mw = obj.matrix_world
+    return sum((mw @ v.co).y for v in verts) / len(verts)
+
+
+class SVG_OT_HoleBoolean(bpy.types.Operator):
+    """Boolean-subtract the active (highlighted) object from every other
+    selected object.  Works on flat SVG layers: the cutter is snapped to
+    Y=0 and given a deep solidify so it punches through any layer depth."""
+    bl_idname = "svg_layer.hole_boolean"
+    bl_label = "Hole"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        cutter = context.active_object
+        if cutter is None or cutter.type not in {'MESH', 'CURVE'}:
+            self.report({'WARNING'}, "Make the hole-shape object active (highlighted).")
+            return {'CANCELLED'}
+
+        targets = [o for o in context.selected_objects
+                   if o.type == 'MESH' and o is not cutter]
+        if not targets:
+            self.report({'WARNING'}, "Select at least one other mesh as the target.")
+            return {'CANCELLED'}
+
+        if context.object.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        # ── Convert cutter if it's a curve ───────────────────────────────
+        if cutter.type == 'CURVE':
+            for spline in cutter.data.splines:
+                spline.use_cyclic_u = True
+            cutter.data.fill_mode = 'FULL'
+            bpy.ops.object.select_all(action='DESELECT')
+            cutter.select_set(True)
+            context.view_layer.objects.active = cutter
+            bpy.ops.object.convert(target='MESH')
+            if len(cutter.data.polygons) == 0:
+                bpy.ops.object.mode_set(mode='EDIT')
+                bpy.ops.mesh.select_all(action='SELECT')
+                bpy.ops.mesh.fill()
+                bpy.ops.object.mode_set(mode='OBJECT')
+
+        # ── Make cutter single-user and apply transforms ──────────────────
+        if cutter.data.users > 1:
+            cutter.data = cutter.data.copy()
+        bpy.ops.object.select_all(action='DESELECT')
+        cutter.select_set(True)
+        context.view_layer.objects.active = cutter
+        bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+
+        # ── Snap cutter centre to Y=0 ─────────────────────────────────────
+        # Shift all vertices so the average world Y lands at 0, keeping the
+        # cutter's X/Z shape exactly where it was drawn.
+        avg_y = _mesh_avg_y(cutter)
+        mw_inv = cutter.matrix_world.inverted()
+        local_delta = mw_inv.to_3x3() @ mathutils.Vector((0.0, -avg_y, 0.0))
+        for v in cutter.data.vertices:
+            v.co += local_delta
+        cutter.data.update()
+
+        # ── Give cutter massive depth so it cuts through any layer ────────
+        # offset=0 centres the slab at Y=0, extending ±100 units each way.
+        sol = cutter.modifiers.new(name="HoleSolidify", type='SOLIDIFY')
+        sol.thickness = 200.0
+        sol.offset = 0.0
+        bpy.ops.object.modifier_apply(modifier="HoleSolidify")
+
+        # ── Boolean subtract cutter from every target ─────────────────────
+        for target in targets:
+            if target.data.users > 1:
+                target.data = target.data.copy()
+            bpy.ops.object.select_all(action='DESELECT')
+            target.select_set(True)
+            context.view_layer.objects.active = target
+
+            bool_mod = target.modifiers.new(name="HoleBoolean", type='BOOLEAN')
+            bool_mod.operation = 'DIFFERENCE'
+            bool_mod.object = cutter
+            bool_mod.solver = 'EXACT'
+            bpy.ops.object.modifier_apply(modifier="HoleBoolean")
+
+        # ── Remove the cutter ─────────────────────────────────────────────
+        bpy.data.objects.remove(cutter, do_unlink=True)
+
+        # Restore selection to targets
+        bpy.ops.object.select_all(action='DESELECT')
+        for target in targets:
+            target.select_set(True)
+        context.view_layer.objects.active = targets[0]
+
+        self.report({'INFO'}, f"Hole: cut {len(targets)} object(s).")
         return {'FINISHED'}
 
 
@@ -1435,7 +1771,10 @@ class SVG_PT_LayerPanel(bpy.types.Panel):
         box.operator("svg_layer.snap_y", icon='SNAP_ON')
         box.operator("svg_layer.snap_to_zero", icon='SNAP_ON')
         box.separator()
+        box.operator("svg_layer.hole_boolean", icon='MOD_BOOLEAN')
         box.operator("svg_layer.manual_process", icon='MODIFIER')
+        box.operator("svg_layer.auto_stack_selected", icon='ALIGN_TOP')
+        box.operator("svg_layer.revert", icon='LOOP_BACK')
         box.operator("svg_layer.random_uv_r", icon='UV')
         box.separator()
         box.prop(context.scene, "svg_layer_randomize_amount", text="Amount")
@@ -1449,6 +1788,94 @@ class SVG_PT_LayerPanel(bpy.types.Panel):
 #  Registration
 # ─────────────────────────────────────────────
 
+class SVG_OT_Revert(bpy.types.Operator):
+    """Remove solidify thickness and back faces from selected objects,
+    leaving only the front-facing flat mesh as seen from the camera.
+    Select front faces -> invert -> delete."""
+    bl_idname = "svg_layer.revert"
+    bl_label = "Revert"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        import bmesh
+
+        objects = [o for o in context.selected_objects if o.type == 'MESH']
+        if not objects:
+            self.report({'WARNING'}, "No mesh objects selected.")
+            return {'CANCELLED'}
+
+        view_fwd = _get_view_forward_world(context)
+        if view_fwd is None:
+            self.report({'WARNING'}, "No 3D viewport found.")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"view_fwd={view_fwd.x:.2f},{view_fwd.y:.2f},{view_fwd.z:.2f}")
+
+        # Ensure object mode before switching per-object.
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        # A face is "front-facing" when its world normal points toward the camera,
+        # i.e. dot(world_normal, view_fwd) < 0.
+        # Threshold 0.1 gives tolerance for faces not perfectly perpendicular
+        # to the view — side/thickness faces (dot ≈ 0) still get deleted.
+        total_deleted = 0
+        for obj in objects:
+            context.view_layer.objects.active = obj
+
+            bpy.ops.object.mode_set(mode='EDIT')
+            bm = bmesh.from_edit_mesh(obj.data)
+            bm.faces.ensure_lookup_table()
+            bm.verts.ensure_lookup_table()
+
+            # Project every vertex onto the view axis.
+            # Front faces have ALL their vertices at the minimum depth (closest
+            # to camera). Back faces and solidify thickness side faces have at
+            # least one vertex deeper.
+            # This is robust against the back-face offset that Manual applies
+            # (which distorts normals on side faces, making normal-based tests
+            # unreliable).
+            vert_depths = [(obj.matrix_world @ v.co).dot(view_fwd) for v in bm.verts]
+            min_depth   = min(vert_depths)
+            max_depth   = max(vert_depths)
+            depth_range = max_depth - min_depth
+
+            if depth_range < 1e-4:
+                self.report({'WARNING'},
+                    f"{obj.name}: mesh appears flat (depth range {depth_range:.4f}) — "
+                    f"apply Manual first before using Revert.")
+                bpy.ops.object.mode_set(mode='OBJECT')
+                continue
+
+            # Tolerance: 5 % of the depth range so minor floating-point
+            # variation doesn't misclassify a front face.
+            tol = depth_range * 0.05
+
+            front_faces = []
+            to_delete   = []
+            for face in bm.faces:
+                face_max_depth = max((obj.matrix_world @ v.co).dot(view_fwd)
+                                     for v in face.verts)
+                if face_max_depth <= min_depth + tol:
+                    front_faces.append(face)
+                else:
+                    to_delete.append(face)
+
+            self.report({'INFO'},
+                f"{obj.name}: {len(bm.faces)} faces, "
+                f"{len(front_faces)} front, "
+                f"{len(to_delete)} to delete. "
+                f"depth range [{min_depth:.3f}, {max_depth:.3f}]")
+
+            bmesh.ops.delete(bm, geom=to_delete, context='FACES')
+            bmesh.update_edit_mesh(obj.data)
+            bpy.ops.object.mode_set(mode='OBJECT')
+            total_deleted += len(to_delete)
+
+        self.report({'INFO'}, f"Revert: deleted {total_deleted} face(s) across {len(objects)} object(s).")
+        return {'FINISHED'}
+
+
 classes = (
     SVG_OT_LoadSVG,
     SVG_OT_ApplyLayers,
@@ -1459,7 +1886,10 @@ classes = (
     SVG_OT_OverrideMaterial,
     SVG_OT_OverrideMaterialSame,
     SVG_OT_AutoStack,
+    SVG_OT_AutoStackSelected,
+    SVG_OT_HoleBoolean,
     SVG_OT_ManualProcess,
+    SVG_OT_Revert,
     SVG_OT_RandomizeFlatten,
     SVG_OT_RandomUVR,
     SVG_PT_LayerPanel,
