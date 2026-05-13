@@ -1,12 +1,12 @@
 # BB SVG Layers — Blender Addon
 
-A Blender 4.2+ extension that automates the full pipeline for converting imported SVG layers into game-ready 3D paper cutout meshes. It handles geometry processing, UV projection, material creation from a Master material using SVG fill colors, and intelligent layer stacking — including multi-character scenes with automatic collection sorting.
+A Blender 4.2+ extension that automates the full pipeline for converting imported SVG layers into game-ready 3D paper cutout meshes. It handles geometry processing, UV projection, material creation from a master material, automatic export to the asset library, and intelligent layer stacking — including multi-character scenes with automatic collection sorting.
 
 ---
 
 ## What It Does
 
-This addon is designed for **paper cutout 3D scenes** where SVG layers become individual mesh pieces stacked along the Y axis, simulating physical depth between paper layers.
+This addon is designed for **paper cutout 3D scenes** where SVG layers become individual mesh pieces stacked along the depth axis, simulating physical depth between paper layers.
 
 ---
 
@@ -33,103 +33,108 @@ This addon is designed for **paper cutout 3D scenes** where SVG layers become in
 
 | Slider | Description |
 |---|---|
-| **Layer Step** | Y distance (in Blender units) between successive layers during stacking. Default: `3.0` |
+| **Tiny Object Threshold** | Objects with surface area below this value (in Blender units²) are always placed in the frontmost layer. Use this to keep whiskers, thin lines and small details on top. Default: `500` |
+| **Layer Step** | Depth separation added between each overlapping layer during stacking. Used by both Auto Stack and Load SVG. Default: `1` |
 
 ---
 
 ### Buttons
 
 #### Load SVG
-The primary entry point. Opens a file picker, imports the selected SVG, and runs the full pipeline automatically:
+Imports an SVG file and automatically runs the full pipeline in one step:
 
-1. Reads element order and fill colors from the SVG file
-2. Imports curves via Blender's built-in SVG importer
-3. Runs **Apply & Sort** — geometry processing and collection sorting (see below)
-4. Runs **Auto Stack** — assigns Y depth from SVG document order
+1. **Reads layer order** from the SVG XML before importing, so document order is preserved regardless of Blender's alphabetical import behaviour
+2. **Imports the SVG** via Blender's built-in importer
+3. **Selects the new collection** created by the importer
+4. **Runs Apply & Sort** — full geometry pipeline on every object in the collection, then sorts them into sub-collections by name prefix:
+   - `BG_` objects → **BG** collection
+   - Character objects (`Wes_`, `Dad_`, etc.) → one collection per character
+   - `FG_` objects → **FG** collection
 
-> **Requires** a material named **`Master`** to exist in the scene before loading. See [Master Material Setup](#master-material-setup).
+   Steps performed on each object:
+   - Rotate +90° on X, Scale ×850, Convert curves to mesh, Apply all transforms
+   - Merge by Distance, Solidify (thickness `1`, applied), Offset back faces (`-2` X, `+2` Z)
+   - UV projection from Y onto 1920×1920 px canvas; back/side faces pinned to `(0, 0)`
+   - **Create material** by copying the **Master** material, injecting the fill color read from the SVG, and assigning it to the object
+   - **Export all created materials** to the **Paper** catalog in the User asset library
 
----
-
-#### Apply & Sort *(called automatically by Load SVG)*
-Runs the full geometry pipeline on all objects in the active collection, then automatically sorts them into sub-collections by name prefix.
-
-Steps performed on each object:
-1. **Rotate +90° on X** — flattens the SVG from Blender's import orientation
-2. **Scale ×850** — converts SVG units to a usable world scale
-3. **Convert curves to mesh** — handles 2D curves before transforms are applied
-4. **Apply all transforms** — bakes location, rotation and scale
-5. **Merge by Distance** — cleans up duplicate vertices from curve conversion
-6. **Solidify modifier** — adds thickness of `1`, then immediately applied
-7. **Offset back faces** — vertices on the back face (identified by Y normal) are moved `-2` on X and `+2` on Z, giving the cutout a characteristic paper-craft lean
-8. **UV projection from Y** — front faces are mapped onto a 1920×1920 px canvas (`U = X / 1920`, `V = Z / 1920`); back and side faces are pinned to `(0, 0)` to avoid atlas stretching
-9. **Create and assign material** — for each object, a copy of the **Master** material is created (or reused if one already exists for that prefix), named after the object's prefix (e.g. `Wes_body`). Its color node is set to the fill color parsed directly from the SVG file. A random Z rotation is applied to the Mapping node for texture variation.
-
-After processing, objects are moved into sub-collections under the active collection, grouped by their name prefix:
-- `BG_` objects → **BG** collection
-- Character objects (`Wes_`, `Dad_`, etc.) → one collection per character, named after the prefix
-- `FG_` objects → **FG** collection
-
----
-
-#### Auto Stack *(called automatically by Load SVG)*
-Assigns Y positions to all mesh objects in the active collection based on SVG document order, using a **greedy overlap-packing algorithm**.
-
-**Algorithm:**
-1. Objects are ordered according to their position in the original SVG document (bottom of stack first)
-2. Each object is placed at Y=0 unless it overlaps something already placed — in which case it steps forward by one **Layer Step**
-3. Overlap is detected using bounding box intersection on the XZ plane
-
-> **Tip:** If you need to re-run stacking after manual edits, you can call Auto Stack from the operator search (`F3`). To control the BG → character → FG depth order, reorder collections in the outliner before running.
-
----
-
-#### Manual
-Applies solidify, merge by distance, back-face offset, and UV projection to **selected mesh objects only**, without touching materials or collections. Use this for objects that were added or modified after the initial Load SVG run.
+5. **Runs Auto Stack** — stacks all objects using a greedy layer-packing algorithm:
+   - Objects below the **Tiny Object Threshold** go to the frontmost layer of their group
+   - Each remaining object is placed in the earliest layer where it doesn't overlap anything already there
+   - Overlap is detected using **face-polygon intersection** in screen space (not bounding boxes), so concave shapes such as U-shapes or cutouts are handled correctly — objects sitting inside a hole are not flagged as overlapping
+   - Collections are processed in outliner order — reorder them in the outliner before loading if needed
+   - Y offset between every layer is controlled by the **Layer Step** slider
 
 ---
 
 #### − / + Buttons
-Move all selected mesh objects one **Layer Step** forward or back, relative to the current view:
-
-- **Orthographic view** — translates along the dominant view axis
-- **Perspective / Camera view** — scales vertices radially from the camera position, preserving the object's apparent on-screen size
-
-> Vertex data is modified directly; object origins are not moved.
+Move all selected objects forward or back along the active viewport's view axis by one **Layer Step**. In perspective view, objects are radially scaled from the camera origin so their apparent size is preserved. Useful for fine-tuning individual layers after Auto Stack.
 
 #### Snap
-Snaps all selected objects to the **highest Y value** among them (measured from world-space bounding box centres). Useful for aligning pieces that should be on the same layer. Object origins are not moved.
+Snaps all selected objects to the **highest Y value** among them — useful for aligning pieces that should be on the same layer.
+
+#### Manual
+Runs the full geometry pipeline on the **currently selected objects** without importing an SVG. Useful when bringing in meshes that weren't created via Load SVG, or for re-processing existing objects.
+
+Steps performed on each selected object:
+- Solidify (thickness `1`, applied), Offset back faces (`-2` X, `+2` Z)
+- UV projection from Y; back/side faces pinned to `(0, 0)`
+- Create or update material from the **Master** template
+
+#### Auto Stack
+Re-stacks the **currently selected objects** along the **active camera / viewport depth axis**. Unlike the Load SVG auto-stack (which uses SVG document order), this button sorts objects by their current depth from the camera and then separates overlapping ones by **Layer Step**.
+
+- Depth is measured as the **vertex-average position** projected onto the view direction — no bounding-box inflation from rotated objects
+- Overlap is tested by projecting each object's actual **face polygons** onto the 2-D view plane, correctly handling concave shapes
+- In perspective view, objects are radially scaled from the camera origin so their screen size is preserved after stacking
+- Non-overlapping objects are left at their current depth — only objects that actually collide in screen space are moved
+- Runs multiple passes until no further moves are needed, resolving cascading overlaps in a single button press
+
+> **Tip:** Point your camera at the scene before clicking — the stacking axis follows whatever view is active.
+
+#### Revert
+Removes the solidify thickness and back faces added by **Manual**, leaving only the original flat front-facing mesh. Useful when you want to return objects to their pre-Manual state for further editing or a different processing pass.
+
+- Identifies front faces by **vertex depth**: a face is kept if all its vertices sit at the minimum depth along the view axis (closest to camera)
+- Back faces and solidify side/thickness faces all have at least one vertex deeper and are deleted
+- Operates on all selected mesh objects in a single pass
+- Reports how many faces were removed per object in the header
+
+> **Note:** Revert must be used **after Manual** — if the object is still flat (no solidify applied), a warning is shown and nothing is deleted.
+
+---
 
 #### Override Single
-Makes a **single-user copy** of the assigned material for each selected object so it can be edited independently. The copy is named `<prefix>_override` (e.g. `Wes_body_override`).
+Makes a **single-user copy** of the assigned material for each selected object, then creates a **library override** so it can be edited independently without affecting other objects. The overridden material is named `<prefix>_override` (e.g. `Wes_body_override`).
 
 #### Override Same
-Same as Override Single, but after creating the override it **reassigns it to every object in the scene** that was using the same original material. Use this when multiple objects share one material and you want them all to switch to the same editable copy in one click.
+Same as Override Single, but after creating the override it **reassigns it to every object in the scene** that was using the same original material. Use this when multiple objects share one material and you want them all to switch to the same editable override in one click.
 
 ---
 
 ## Master Material Setup
 
-Materials are created as **copies of a material named `Master`** that must exist in your scene before importing. The addon reads each SVG element's fill color and injects it into the copy's color node (an RGB node named `Color`, a plain RGB node, or the Principled BSDF Base Color, searched in that order). A random Z rotation is also applied to the first Mapping node for texture variation.
+Materials are created automatically at import time by copying a local material named **`Master`** and injecting the fill color read from the SVG file.
 
 ### Steps to set up
 
-1. Create a material and name it exactly **`Master`**
-2. Set up your node graph — include an **RGB node named `Color`** (or any RGB node) to act as the color injection point
-3. Add a **Mapping node** if you want per-object texture rotation randomization
-4. Save it in your scene — the addon will copy it automatically for each prefix on import
+1. In your `.blend` file, create a material named exactly **`Master`**
+2. Set up its node tree however you like — the addon will find the first `RGB` node, node named `Color`, Principled BSDF Base Color input, or any `RGBA` input named `Color`, and write the SVG fill color into it
+3. If your Master material has a **Mapping** node, its Z rotation will be randomised on each copy for natural texture variation
+
+All created materials are automatically marked as assets and written to a **Paper** catalog in your configured User asset library.
 
 ### Name Matching
 
-The addon strips Blender's duplicate suffix from the object name to determine the material name:
+The addon derives the material name from the object name by stripping Blender's duplicate suffix:
 
 | Object name | Material created |
 |---|---|
 | `Wes_body` | `Wes_body` |
-| `Wes_body.001` | `Wes_body` (reused) |
+| `Wes_body.001` | `Wes_body` |
 | `BG_sky.014` | `BG_sky` |
 
-Created materials are also automatically exported to the **Paper** catalog in your configured User Library for asset browser access.
+If a material named `<prefix>` already exists locally it is reused and its color updated rather than creating a duplicate.
 
 ---
 
@@ -145,13 +150,19 @@ For multi-character scenes, name your SVG layers with prefixes:
 
 ---
 
-## Typical Workflow
+## Typical Workflows
 
-1. Create a **`Master`** material in your scene
-2. In the **SVG Layer** panel, set the **Layer Step** to taste
-3. Click **Load SVG** and select your SVG file — geometry processing, material creation, collection sorting, and layer stacking all run automatically
+### Full automatic pipeline
+1. Create a material named **`Master`** in your `.blend` file and set up its node tree
+2. *(Optional)* Reorder collections in the outliner to set the desired BG → characters → FG depth order
+3. Click **Load SVG** and select your file — geometry processing, material creation, collection sorting, and layer stacking all run automatically
 4. Fine-tune with **− / +**, **Snap**, **Override Single**, and **Override Same** as needed
-5. Use **Manual** to reprocess any mesh objects added or edited after the initial import
+
+### Manual pipeline (selected objects)
+1. Select the objects you want to process
+2. Click **Manual** — applies solidify, UV projection, and material assignment
+3. Point the camera at your scene, select the processed objects, and click **Auto Stack** — objects are separated along the camera depth axis
+4. *(Optional)* Click **Revert** to strip the solidify back and return objects to flat meshes
 
 ---
 
@@ -168,7 +179,8 @@ bb_svg_layers/
 ## Requirements
 
 - Blender 4.2 or later
-- A material named **`Master`** in the scene (for material creation)
+- A local material named **`Master`** in the current `.blend` file (used as the template for all created materials)
+- A configured asset library in **Preferences → File Paths → Asset Libraries** (for exporting the generated materials)
 
 ---
 
