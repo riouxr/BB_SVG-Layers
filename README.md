@@ -29,12 +29,12 @@ This addon is designed for **paper cutout 3D scenes** where SVG layers become in
 
 ## Controls
 
-### Slider
+### Sliders
 
 | Slider | Description |
 |---|---|
-| **Tiny Object Threshold** | Objects with surface area below this value (in Blender units²) are always placed in the frontmost layer. Use this to keep whiskers, thin lines and small details on top. Default: `500` |
-| **Layer Step** | Depth separation added between each overlapping layer during stacking. Used by both Auto Stack and Load SVG. Default: `1` |
+| **Layer Step** | Depth separation added between each overlapping layer during stacking. Used by both Auto Stack and Load SVG. Default: `3` |
+| **Amount** | Vertex randomize offset applied before Y-flatten by the **Randomize** button. Default: `2` |
 
 ---
 
@@ -54,61 +54,86 @@ Imports an SVG file and automatically runs the full pipeline in one step:
    Steps performed on each object:
    - Rotate +90° on X, Scale ×850, Convert curves to mesh, Apply all transforms
    - Merge by Distance, Solidify (thickness `1`, applied), Offset back faces (`-2` X, `+2` Z)
-   - UV projection from Y onto 1920×1920 px canvas; back/side faces pinned to `(0, 0)`
+   - UV projection from Y onto a 1920×1920 px canvas; back/side faces pinned to `(0, 0)`
    - **Create material** by copying the **Master** material, injecting the fill color read from the SVG, and assigning it to the object
    - **Export all created materials** to the **Paper** catalog in the User asset library
 
-5. **Runs Auto Stack** — stacks all objects using a greedy layer-packing algorithm:
-   - Objects below the **Tiny Object Threshold** go to the frontmost layer of their group
-   - Each remaining object is placed in the earliest layer where it doesn't overlap anything already there
-   - Overlap is detected using **face-polygon intersection** in screen space (not bounding boxes), so concave shapes such as U-shapes or cutouts are handled correctly — objects sitting inside a hole are not flagged as overlapping
-   - Collections are processed in outliner order — reorder them in the outliner before loading if needed
-   - Y offset between every layer is controlled by the **Layer Step** slider
+5. **Runs Auto Stack** — stacks all objects using a greedy layer-packing algorithm, using face-polygon intersection in screen space (not bounding boxes) so concave shapes are handled correctly
 
 ---
 
+#### All Others *(toggle)*
+When **ON**, the **−** and **+** buttons operate on every mesh in the scene that is *not* currently selected, leaving the selection itself untouched. When **OFF** (default), they act on the selection as normal.
+
+Useful for nudging an entire background or foreground group as a unit while keeping focus on a few specific selected objects.
+
 #### − / + Buttons
-Move all selected objects forward or back along the active viewport's view axis by one **Layer Step**. In perspective view, objects are radially scaled from the camera origin so their apparent size is preserved. Useful for fine-tuning individual layers after Auto Stack.
+Move objects forward or back along the active viewport's view axis by one **Layer Step**. In perspective view, objects are radially scaled from the camera origin so their apparent screen size is preserved.
+
+Which objects are affected depends on the **All Others** toggle above.
 
 #### Snap
-Snaps all selected objects to the **highest Y value** among them — useful for aligning pieces that should be on the same layer.
+Snaps all selected objects to the **depth of the active (highlighted) object**, aligning them to the same layer along the view axis. Useful for bringing stray pieces flush with the layer they belong to.
+
+#### Snap to 0
+Translates all selected objects so their bounding-box centre lands at **Y = 0** in world space. In perspective view, radially scales from the camera origin to preserve apparent size.
+
+---
+
+#### Hole
+Boolean-subtracts the **active (highlighted)** object from every other selected mesh. The cutter is automatically snapped to Y = 0 and given a 200-unit solidify depth so it punches cleanly through any layer stack. The cutter object is removed after the operation.
+
+> Make the shape you want to cut out the active object, then shift-select the targets before clicking.
 
 #### Manual
-Runs the full geometry pipeline on the **currently selected objects** without importing an SVG. Useful when bringing in meshes that weren't created via Load SVG, or for re-processing existing objects.
+Runs the full geometry pipeline on the **currently selected objects** without importing an SVG. Useful for objects brought in by other means or for re-processing existing geometry.
 
 Steps performed on each selected object:
-- Solidify (thickness `1`, applied), Offset back faces (`-2` X, `+2` Z)
-- UV projection from Y; back/side faces pinned to `(0, 0)`
-- Create or update material from the **Master** template
+- Convert curves to mesh (if needed), Apply all transforms
+- Merge by Distance, Solidify (thickness `1`, applied), Offset back faces (`-2` X, `+2` Z)
+- UV projection from Y onto the 1920×1920 canvas; back/side faces pinned to `(0, 0)`
+- Random UV rotation applied independently per object
 
 #### Auto Stack
-Re-stacks the **currently selected objects** along the **active camera / viewport depth axis**. Unlike the Load SVG auto-stack (which uses SVG document order), this button sorts objects by their current depth from the camera and then separates overlapping ones by **Layer Step**.
+Re-stacks the **currently selected objects** along the **active camera / viewport depth axis**.
 
-- Depth is measured as the **vertex-average position** projected onto the view direction — no bounding-box inflation from rotated objects
-- Overlap is tested by projecting each object's actual **face polygons** onto the 2-D view plane, correctly handling concave shapes
-- In perspective view, objects are radially scaled from the camera origin so their screen size is preserved after stacking
+- Objects are sorted by their current vertex-average depth, then separated by **Layer Step** wherever their projected face polygons overlap in screen space
+- In perspective view, radial scaling from the camera origin preserves apparent screen size after stacking
 - Non-overlapping objects are left at their current depth — only objects that actually collide in screen space are moved
-- Runs multiple passes until no further moves are needed, resolving cascading overlaps in a single button press
+- Runs multiple passes until no further moves are needed, resolving cascading overlaps in a single click
 
 > **Tip:** Point your camera at the scene before clicking — the stacking axis follows whatever view is active.
 
 #### Revert
-Removes the solidify thickness and back faces added by **Manual**, leaving only the original flat front-facing mesh. Useful when you want to return objects to their pre-Manual state for further editing or a different processing pass.
+Strips the solidify thickness and back faces added by **Manual**, leaving only the original flat front-facing mesh. Useful for returning objects to their pre-Manual state for further editing or a different processing pass.
 
-- Identifies front faces by **vertex depth**: a face is kept if all its vertices sit at the minimum depth along the view axis (closest to camera)
-- Back faces and solidify side/thickness faces all have at least one vertex deeper and are deleted
-- Operates on all selected mesh objects in a single pass
-- Reports how many faces were removed per object in the header
+- Identifies front faces by vertex depth: a face is kept if all its vertices sit at the minimum depth along the view axis (closest to camera)
+- Back and thickness faces all have at least one vertex deeper and are deleted
+- Reports how many faces were removed per object
 
-> **Note:** Revert must be used **after Manual** — if the object is still flat (no solidify applied), a warning is shown and nothing is deleted.
+> **Note:** Apply **Manual** before using Revert — if the object is already flat, a warning is shown and nothing is deleted.
+
+#### Random UV R
+Projects UVs from the front-face X/Z coordinates (identical to Manual's UV pass), then applies a **random rotation** to each object's UVs independently around their centroid. Useful for breaking up tiling texture repetition across a set of similar shapes.
+
+#### Stack UVs
+Projects UVs on all selected mesh objects using the same front-face X/Z mapping as **Manual** — front-facing polys get `(X / 1920, Z / 1920)`, all other faces get `(0, 0)` — **without** any random rotation. Use this when you want all selected objects to share a consistent, non-rotated UV layout, for example when stacking identical cards or tiles that should align perfectly.
+
+---
+
+#### Amount *(slider)*
+Controls the vertex offset magnitude used by **Randomize** (below).
+
+#### Randomize
+Randomly displaces every vertex of each selected object by up to **Amount** units in X, Y, and Z, then flattens all vertices across all selected objects to their **global average Y**. Creates organic variation in flat paper layers while keeping them coplanar.
 
 ---
 
 #### Override Single
-Makes a **single-user copy** of the assigned material for each selected object, then creates a **library override** so it can be edited independently without affecting other objects. The overridden material is named `<prefix>_override` (e.g. `Wes_body_override`).
+Makes a fully local, single-user copy of the material on each selected object. The copy is detached from any library links so it can be edited independently. Named `<original>_local`.
 
 #### Override Same
-Same as Override Single, but after creating the override it **reassigns it to every object in the scene** that was using the same original material. Use this when multiple objects share one material and you want them all to switch to the same editable override in one click.
+Same as Override Single, but after creating the local copy it **reassigns it to every object in the scene** that was using the same original material. Use this when multiple objects share a material and you want them all to switch to an editable local copy in one click.
 
 ---
 
@@ -160,9 +185,15 @@ For multi-character scenes, name your SVG layers with prefixes:
 
 ### Manual pipeline (selected objects)
 1. Select the objects you want to process
-2. Click **Manual** — applies solidify, UV projection, and material assignment
+2. Click **Manual** — applies solidify, UV projection, and per-object random UV rotation
 3. Point the camera at your scene, select the processed objects, and click **Auto Stack** — objects are separated along the camera depth axis
 4. *(Optional)* Click **Revert** to strip the solidify back and return objects to flat meshes
+
+### Fine-tuning layer depth
+- Select a few key objects and use **− / +** to shift them forward or back one step at a time
+- Enable **All Others** to instead nudge everything *except* your selection — handy for pushing an entire background group back without deselecting your current working set
+- Use **Snap** to align multiple objects to the same depth as the highlighted one
+- Use **Snap to 0** to pull objects back to the scene origin
 
 ---
 

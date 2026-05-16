@@ -865,47 +865,30 @@ def _move_obj_perspective(obj, cam_world_pos, view_fwd_world, step):
     """Move obj along the view ray by *step* world units while preserving its
     apparent angular size as seen from cam_world_pos.
 
-    Strategy:
-      1. Convert cam_world_pos into the object's local space.
-      2. Temporarily shift all vertices so the pivot is at the camera.
-      3. Scale vertices uniformly by (depth + step) / depth — pure radial
-         scale around the camera, angular size is conserved.
-      4. Shift vertices back to restore the real origin position.
+    Depth is measured as vertex-average position along the view axis — same
+    metric used by Auto Stack and Snap — so the step is always exactly *step*
+    world units regardless of object rotation or bounding-box shape.
+
+    Factor = (obj_depth - cam_depth + step) / (obj_depth - cam_depth)
+    Applied as a radial scale of all vertices from the camera origin in local
+    space, so angular size is conserved.
     """
-    mw = obj.matrix_world
+    mw     = obj.matrix_world
     mw_inv = mw.inverted()
 
-    # Camera in local object space (accounts for object location/rotation/scale).
-    cam_local = mw_inv @ cam_world_pos
+    # Vertex-average depth in world space — no bounding box.
+    obj_depth = _vert_avg_depth(obj, view_fwd_world)
+    cam_depth = cam_world_pos.dot(view_fwd_world)
+    depth_from_cam = obj_depth - cam_depth
 
-    # Step 1: shift so pivot is at the camera.
-    for v in obj.data.vertices:
-        v.co -= cam_local
-
-    # Depth: signed distance from camera to mesh centre along the view ray.
-    center_shifted = sum(
-        (mathutils.Vector(c) for c in obj.bound_box),
-        mathutils.Vector(),
-    ) / 8.0 - cam_local
-    # Only rotation+scale needed to get the world-space direction.
-    center_world_dir = mw.to_3x3() @ center_shifted
-    depth = center_world_dir.dot(view_fwd_world)
-
-    if abs(depth) < 1e-4:
-        for v in obj.data.vertices:
-            v.co += cam_local
-        obj.data.update()
+    if abs(depth_from_cam) < 1e-4:
         return
 
-    factor = (depth + step) / depth
+    factor    = (depth_from_cam + step) / depth_from_cam
+    cam_local = mw_inv @ cam_world_pos
 
-    # Step 2: radial scale around the camera pivot.
     for v in obj.data.vertices:
-        v.co *= factor
-
-    # Step 3: restore the real origin.
-    for v in obj.data.vertices:
-        v.co += cam_local
+        v.co = cam_local + (v.co - cam_local) * factor
 
     obj.data.update()
 
@@ -919,9 +902,13 @@ class SVG_OT_MoveForward(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        objects = list(context.selected_objects)
+        selected = set(o.name for o in context.selected_objects)
+        if context.scene.svg_layer_all_others:
+            objects = [o for o in context.scene.objects if o.name not in selected]
+        else:
+            objects = list(context.selected_objects)
         if not objects:
-            self.report({'WARNING'}, "No objects selected.")
+            self.report({'WARNING'}, "No objects selected." if not context.scene.svg_layer_all_others else "No unselected objects found.")
             return {'CANCELLED'}
         view_fwd = _get_view_forward_world(context)
         if view_fwd is None:
@@ -954,9 +941,13 @@ class SVG_OT_MoveBack(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        objects = list(context.selected_objects)
+        selected = set(o.name for o in context.selected_objects)
+        if context.scene.svg_layer_all_others:
+            objects = [o for o in context.scene.objects if o.name not in selected]
+        else:
+            objects = list(context.selected_objects)
         if not objects:
-            self.report({'WARNING'}, "No objects selected.")
+            self.report({'WARNING'}, "No unselected objects found." if context.scene.svg_layer_all_others else "No objects selected.")
             return {'CANCELLED'}
         view_fwd = _get_view_forward_world(context)
         if view_fwd is None:
@@ -1013,18 +1004,13 @@ def _snap_obj_to_world_y(obj, cam_world_pos, target_y):
 
 
 class SVG_OT_SnapY(bpy.types.Operator):
-    """Snap all selected objects to the highest Y value among them.
-    Orthographic: pure Y translation (vertex data, origin untouched).
-    Camera / perspective: radial scale from the camera origin so the bbox
-    centre lands at exactly the same world Y while apparent size is preserved."""
+    """Snap all selected objects to the shallowest (closest to camera) depth
+    among them, measured as vertex-average position along the view axis.
+    Ortho: plain translation. Perspective: radial scale from camera origin
+    so apparent size is preserved. No bounding boxes used."""
     bl_idname = "svg_layer.snap_y"
     bl_label = "Snap"
     bl_options = {'REGISTER', 'UNDO'}
-
-    @staticmethod
-    def _mesh_world_y(obj):
-        corners = [obj.matrix_world @ mathutils.Vector(c) for c in obj.bound_box]
-        return sum(c.y for c in corners) / 8.0
 
     def execute(self, context):
         objects = [o for o in context.selected_objects if o.type == 'MESH']
@@ -1032,44 +1018,36 @@ class SVG_OT_SnapY(bpy.types.Operator):
             self.report({'WARNING'}, "No mesh objects selected.")
             return {'CANCELLED'}
 
-        # Single object: flatten all its vertices to their average Y
-        if len(objects) == 1:
-            obj = objects[0]
-            mw = obj.matrix_world
-            mw_inv = mw.inverted()
-            world_ys = [(mw @ v.co).y for v in obj.data.vertices]
-            if not world_ys:
-                return {'FINISHED'}
-            avg_y = sum(world_ys) / len(world_ys)
-            for v in obj.data.vertices:
-                world_co = mw @ v.co
-                world_co.y = avg_y
-                v.co = mw_inv @ world_co
-            obj.data.update()
-            return {'FINISHED'}
+        view_fwd = _get_view_forward_world(context)
+        if view_fwd is None:
+            self.report({'WARNING'}, "No 3D viewport found.")
+            return {'CANCELLED'}
 
-        # Multiple objects: snap all to the highest bbox-centre Y
-        mesh_ys = {obj: self._mesh_world_y(obj) for obj in objects}
-        max_mesh_y = max(mesh_ys.values())
-
+        cam_pos = None
         if not _is_orthographic(context):
             cam_pos = _get_camera_world_location(context)
             if cam_pos is None:
                 self.report({'WARNING'}, "Could not find camera position.")
                 return {'CANCELLED'}
-            for obj in objects:
-                if abs(mesh_ys[obj] - max_mesh_y) < 1e-6:
-                    continue
-                _snap_obj_to_world_y(obj, cam_pos, max_mesh_y)
-        else:
-            for obj in objects:
-                delta_y = max_mesh_y - mesh_ys[obj]
-                if abs(delta_y) < 1e-6:
-                    continue
-                local_delta = obj.matrix_world.to_3x3().inverted() @ mathutils.Vector((0.0, delta_y, 0.0))
-                for v in obj.data.vertices:
-                    v.co += local_delta
-                obj.data.update()
+
+        # Use the active (highlighted) object as the depth target.
+        active = context.active_object
+        if active is None or active.type != 'MESH' or active not in objects:
+            self.report({'WARNING'}, "No active mesh object — highlight one to snap to.")
+            return {'CANCELLED'}
+
+        # Vertex-average depth along the view axis — same metric as Auto Stack.
+        depths = {obj: _vert_avg_depth(obj, view_fwd) for obj in objects}
+        target_depth = depths[active]
+
+        for obj in objects:
+            delta = target_depth - depths[obj]
+            if abs(delta) < 1e-6:
+                continue
+            if cam_pos is not None:
+                _move_obj_perspective(obj, cam_pos, view_fwd, delta)
+            else:
+                _move_obj_ortho(obj, view_fwd, delta)
 
         return {'FINISHED'}
 
@@ -1747,6 +1725,41 @@ class SVG_OT_RandomUVR(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class SVG_OT_StackUVs(bpy.types.Operator):
+    """Project UVs on all selected mesh objects the same way Manual does
+    (front-facing faces: X/Z coords; back-facing faces: 0,0) without
+    any random rotation."""
+    bl_idname = "svg_layer.stack_uvs"
+    bl_label = "Stack UVs"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        objects = [o for o in context.selected_objects if o.type == 'MESH']
+        if not objects:
+            self.report({'WARNING'}, "No mesh objects selected.")
+            return {'CANCELLED'}
+
+        canvas = 1920.0
+        for obj in objects:
+            mesh = obj.data
+            if not mesh.uv_layers:
+                mesh.uv_layers.new(name="UVMap")
+            uv_layer = mesh.uv_layers.active
+            if uv_layer is None:
+                continue
+            for poly in mesh.polygons:
+                for loop_idx in poly.loop_indices:
+                    loop = mesh.loops[loop_idx]
+                    vert = mesh.vertices[loop.vertex_index]
+                    if poly.normal.y < -0.5:
+                        uv_layer.data[loop_idx].uv = (vert.co.x / canvas, vert.co.z / canvas)
+                    else:
+                        uv_layer.data[loop_idx].uv = (0.0, 0.0)
+
+        self.report({'INFO'}, f"Stack UVs: projected {len(objects)} object(s).")
+        return {'FINISHED'}
+
+
 # ─────────────────────────────────────────────
 #  Panel
 # ─────────────────────────────────────────────
@@ -1765,6 +1778,7 @@ class SVG_PT_LayerPanel(bpy.types.Panel):
         box.prop(context.scene, "svg_layer_step", text="Layer Step")
         box.operator("svg_layer.load_svg", icon='FILE_IMAGE')
         box.separator()
+        box.prop(context.scene, "svg_layer_all_others", text="All Others", toggle=True)
         row = box.row(align=True)
         row.operator("svg_layer.move_forward", text="-", icon='REMOVE')
         row.operator("svg_layer.move_back", text="+", icon='ADD')
@@ -1776,6 +1790,7 @@ class SVG_PT_LayerPanel(bpy.types.Panel):
         box.operator("svg_layer.auto_stack_selected", icon='ALIGN_TOP')
         box.operator("svg_layer.revert", icon='LOOP_BACK')
         box.operator("svg_layer.random_uv_r", icon='UV')
+        box.operator("svg_layer.stack_uvs", icon='UV_DATA')
         box.separator()
         box.prop(context.scene, "svg_layer_randomize_amount", text="Amount")
         box.operator("svg_layer.randomize_flatten", icon='RNDCURVE')
@@ -1892,6 +1907,7 @@ classes = (
     SVG_OT_Revert,
     SVG_OT_RandomizeFlatten,
     SVG_OT_RandomUVR,
+    SVG_OT_StackUVs,
     SVG_PT_LayerPanel,
 )
 
@@ -1899,6 +1915,12 @@ classes = (
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
+
+    bpy.types.Scene.svg_layer_all_others = bpy.props.BoolProperty(
+        name="All Others",
+        description="When ON, - and + buttons affect all objects NOT in the current selection",
+        default=False,
+    )
 
     bpy.types.Scene.svg_layer_step = bpy.props.FloatProperty(
         name="Layer Step",
@@ -1924,5 +1946,6 @@ def register():
 def unregister():
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
+    del bpy.types.Scene.svg_layer_all_others
     del bpy.types.Scene.svg_layer_step
     del bpy.types.Scene.svg_layer_randomize_amount
