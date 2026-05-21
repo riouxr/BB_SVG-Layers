@@ -1105,55 +1105,98 @@ class SVG_OT_OverrideMaterial(bpy.types.Operator):
 
     @staticmethod
     def _make_local_copy(mat, new_name):
-        """Return a fully local copy of mat with all library links removed."""
+        """Return a fully local copy of mat with a fully independent node tree."""
         new_mat = mat.copy()
         new_mat.name = new_name
-        # Make the datablock itself local (breaks the library reference)
+
+        # Break direct library link
         if new_mat.library is not None:
             new_mat.make_local()
-        # Remove override_library so Blender stops treating it as linked
+
+        # Break override_library relationship
         if getattr(new_mat, "override_library", None) is not None:
             try:
-                new_mat.override_library.reset()
+                new_mat.make_local()
             except Exception:
                 pass
-        # Detach every node's id links so textures / node-groups become local
+
         if new_mat.use_nodes and new_mat.node_tree:
-            for node in new_mat.node_tree.nodes:
+            nt = new_mat.node_tree
+
+            # Break node tree library / override links
+            if nt.library is not None:
+                nt.make_local()
+            if getattr(nt, "override_library", None) is not None:
+                try:
+                    nt.make_local()
+                except Exception:
+                    pass
+
+            # Walk nodes and localise any linked images or node-groups
+            for node in nt.nodes:
                 if hasattr(node, "image") and node.image is not None:
                     if node.image.library is not None:
                         node.image = node.image.copy()
                         node.image.make_local()
                 if hasattr(node, "node_tree") and node.node_tree is not None:
-                    if node.node_tree.library is not None:
-                        node.node_tree = node.node_tree.copy()
+                    ng = node.node_tree
+                    if ng.library is not None:
+                        node.node_tree = ng.copy()
                         node.node_tree.make_local()
+                    if getattr(ng, "override_library", None) is not None:
+                        try:
+                            ng.make_local()
+                        except Exception:
+                            pass
+
         return new_mat
 
     def execute(self, context):
-        objects = gather_objects(context)
-        objects = [o for o in objects if o.type == 'MESH']
+        # Override Single works on selected objects only — never the whole collection.
+        objects = [o for o in context.selected_objects if o.type == 'MESH']
 
         if not objects:
             self.report({'WARNING'}, "No mesh objects found.")
             return {'CANCELLED'}
 
         overridden = 0
+        already_local = 0
         skipped = []
 
         for obj in objects:
-            if not obj.data.materials or obj.data.materials[0] is None:
+            # Read from the slot so we get what the object actually displays,
+            # regardless of DATA/OBJECT link mode.
+            if not obj.material_slots or obj.material_slots[0].material is None:
                 skipped.append(obj.name)
                 continue
-            mat = obj.data.materials[0]
+
+            slot = obj.material_slots[0]
+            mat  = slot.material
+
+            # Skip if the slot is already a unique local OBJECT-linked copy
+            # whose node tree is also private (single user).
+            nt = mat.node_tree if (mat.use_nodes and mat.node_tree) else None
+            nt_is_private = (nt is None or nt.users == 1)
+            if (slot.link == 'OBJECT'
+                    and mat.library is None
+                    and getattr(mat, 'override_library', None) is None
+                    and mat.users == 1
+                    and nt_is_private):
+                already_local += 1
+                continue
+
             new_name = obj.name.split('.')[0] + "_local"
-            new_mat = self._make_local_copy(mat, new_name)
-            obj.data.materials[0] = new_mat
+            new_mat  = self._make_local_copy(mat, new_name)
+
+            # Switch the slot to OBJECT link so the assignment is per-object
+            # and does not touch the shared mesh data.
+            obj.material_slots[0].link     = 'OBJECT'
+            obj.material_slots[0].material = new_mat
             overridden += 1
 
         if skipped:
-            self.report({'WARNING'},
-                f"Localised {overridden} material(s). No material on: {', '.join(skipped)}")
+            self.report({'INFO'},
+                f"Localised {overridden} material(s). Skipped (no material): {', '.join(skipped)}")
         else:
             self.report({'INFO'}, f"Localised {overridden} material(s).")
 
@@ -1172,53 +1215,99 @@ class SVG_OT_OverrideMaterialSame(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        objects = gather_objects(context)
-        objects = [o for o in objects if o.type == 'MESH']
+        # Step 1 — collect unique source materials from selected objects.
+        source_objects = [o for o in context.selected_objects if o.type == 'MESH']
 
-        if not objects:
-            self.report({'WARNING'}, "No mesh objects found.")
+        if not source_objects:
+            self.report({'WARNING'}, "No mesh objects selected.")
             return {'CANCELLED'}
 
-        local_map = {}   # original mat name -> new local mat
-        skipped = []
+        local_map = {}  # original mat  -> one shared local copy
+        skipped   = []
 
-        for obj in objects:
-            if not obj.data.materials or obj.data.materials[0] is None:
+        for obj in source_objects:
+            if not obj.material_slots or obj.material_slots[0].material is None:
                 skipped.append(obj.name)
                 continue
-            original_mat = obj.data.materials[0]
-            if original_mat.name in local_map:
+            original_mat = obj.material_slots[0].material
+            if original_mat in local_map:
+                continue
+            # Skip if this material is already a unique local copy
+            if (original_mat.library is None
+                    and getattr(original_mat, 'override_library', None) is None):
+                local_map[original_mat] = original_mat  # already local — reuse as-is
                 continue
             new_name = original_mat.name.split('.')[0] + "_local"
-            new_mat = SVG_OT_OverrideMaterial._make_local_copy(original_mat, new_name)
-            local_map[original_mat.name] = new_mat
+            new_mat  = SVG_OT_OverrideMaterial._make_local_copy(original_mat, new_name)
+            local_map[original_mat] = new_mat
 
         if not local_map:
             self.report({'WARNING'}, "No materials to localise.")
             return {'CANCELLED'}
 
+        # Step 2 — assign the shared local copy to every scene object that
+        #          uses one of the source materials, using OBJECT-linked slots
+        #          so we never write to shared mesh data.
         assigned = 0
         for scene_obj in context.scene.objects:
-            if scene_obj.type != 'MESH' or not scene_obj.data.materials:
+            if scene_obj.type != 'MESH':
                 continue
-            for slot_idx, mat in enumerate(scene_obj.data.materials):
-                if mat is not None and mat.name in local_map:
-                    scene_obj.data.materials[slot_idx] = local_map[mat.name]
+            for slot in scene_obj.material_slots:
+                if slot.material in local_map:
+                    local_mat = local_map[slot.material]
+                    if slot.material is local_mat:
+                        continue  # already the local copy, nothing to do
+                    slot.link     = 'OBJECT'
+                    slot.material = local_mat
                     assigned += 1
 
+        msg = f"Localised {len(local_map)} material(s), assigned to {assigned} slot(s)."
         if skipped:
-            self.report({'WARNING'},
-                f"Localised {len(local_map)} material(s), assigned to {assigned} slot(s). "
-                f"No material on: {', '.join(skipped)}")
+            self.report({'INFO'}, msg + f" Skipped (no material): {', '.join(skipped)}")
         else:
-            self.report({'INFO'},
-                f"Localised {len(local_map)} material(s), assigned to {assigned} slot(s).")
+            self.report({'INFO'}, msg)
 
         return {'FINISHED'}
 
 
 # ─────────────────────────────────────────────
 #  Operator: Auto Stack
+# ─────────────────────────────────────────────
+#  Operator: Purge Unused Materials
+# ─────────────────────────────────────────────
+
+class SVG_OT_PurgeUnusedMaterials(bpy.types.Operator):
+    """Delete every material not assigned to any object slot in the scene.
+    Works even when Blender's built-in purge finds nothing, because it
+    ignores the fake-user flag and checks real slot assignments directly."""
+    bl_idname  = "svg_layer.purge_unused_materials"
+    bl_label   = "Purge Unused Materials"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        # Collect every material that is actually displayed.
+        # slot.material already resolves DATA vs OBJECT link, so this covers
+        # both link types without picking up mesh-data ghost materials that
+        # are stored in mesh.materials but overridden at the object level.
+        used = set()
+        for obj in bpy.data.objects:
+            for slot in obj.material_slots:
+                if slot.material is not None:
+                    used.add(slot.material)
+
+        removed = 0
+        for mat in list(bpy.data.materials):
+            if mat not in used:
+                mat.use_fake_user = False   # clear fake user so remove() works
+                bpy.data.materials.remove(mat)
+                removed += 1
+
+        self.report({'INFO'},
+            f"Removed {removed} unused material(s). "
+            f"{len(bpy.data.materials)} remaining.")
+        return {'FINISHED'}
+
+
 # ─────────────────────────────────────────────
 
 class SVG_OT_AutoStack(bpy.types.Operator):
@@ -1797,6 +1886,7 @@ class SVG_PT_LayerPanel(bpy.types.Panel):
         box.separator()
         box.operator("svg_layer.override_material", icon='LIBRARY_DATA_OVERRIDE')
         box.operator("svg_layer.override_material_same", icon='LIBRARY_DATA_OVERRIDE')
+        box.operator("svg_layer.purge_unused_materials", icon='TRASH')
 
 
 # ─────────────────────────────────────────────
@@ -1900,6 +1990,7 @@ classes = (
     SVG_OT_SnapToZero,
     SVG_OT_OverrideMaterial,
     SVG_OT_OverrideMaterialSame,
+    SVG_OT_PurgeUnusedMaterials,
     SVG_OT_AutoStack,
     SVG_OT_AutoStackSelected,
     SVG_OT_HoleBoolean,
