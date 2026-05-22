@@ -1125,7 +1125,10 @@ class SVG_OT_OverrideMaterial(bpy.types.Operator):
 
             # Break node tree library / override links
             if nt.library is not None:
-                nt.make_local()
+                try:
+                    nt.make_local()
+                except Exception:
+                    pass
             if getattr(nt, "override_library", None) is not None:
                 try:
                     nt.make_local()
