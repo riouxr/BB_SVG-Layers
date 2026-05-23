@@ -1093,6 +1093,37 @@ class SVG_OT_SnapToZero(bpy.types.Operator):
 
 
 # ─────────────────────────────────────────────
+#  Operator: Flatten
+# ─────────────────────────────────────────────
+
+class SVG_OT_Flatten(bpy.types.Operator):
+    """Set every vertex of each selected mesh to Y=0 in world space.
+    Unlike Snap to 0 (which translates the whole object), this pins each
+    vertex individually — any depth variation in the mesh is removed."""
+    bl_idname  = "svg_layer.flatten"
+    bl_label   = "Flatten"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        objects = [o for o in context.selected_objects if o.type == 'MESH']
+        if not objects:
+            self.report({'WARNING'}, "No mesh objects selected.")
+            return {'CANCELLED'}
+
+        for obj in objects:
+            mw     = obj.matrix_world
+            mw_inv = mw.inverted()
+            for v in obj.data.vertices:
+                world_co   = mw @ v.co
+                world_co.y = 0.0
+                v.co       = mw_inv @ world_co
+            obj.data.update()
+
+        self.report({'INFO'}, f"Flattened {len(objects)} object(s) to Y=0.")
+        return {'FINISHED'}
+
+
+# ─────────────────────────────────────────────
 #  Operator: Override Material
 # ─────────────────────────────────────────────
 
@@ -1876,6 +1907,7 @@ class SVG_PT_LayerPanel(bpy.types.Panel):
         row.operator("svg_layer.move_back", text="+", icon='ADD')
         box.operator("svg_layer.snap_y", icon='SNAP_ON')
         box.operator("svg_layer.snap_to_zero", icon='SNAP_ON')
+        box.operator("svg_layer.flatten", icon='MESH_PLANE')
         box.separator()
         box.operator("svg_layer.hole_boolean", icon='MOD_BOOLEAN')
         box.operator("svg_layer.manual_process", icon='MODIFIER')
@@ -1991,6 +2023,7 @@ classes = (
     SVG_OT_MoveBack,
     SVG_OT_SnapY,
     SVG_OT_SnapToZero,
+    SVG_OT_Flatten,
     SVG_OT_OverrideMaterial,
     SVG_OT_OverrideMaterialSame,
     SVG_OT_PurgeUnusedMaterials,
