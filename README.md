@@ -83,6 +83,9 @@ Snaps all selected objects to the **depth of the active (highlighted) object**, 
 #### Snap to 0
 Translates all selected objects so their bounding-box centre lands at **Y = 0** in world space. In perspective view, radially scales from the camera origin to preserve apparent size.
 
+#### Flatten
+Like **Snap to 0**, but operates on **vertices instead of whole objects** — every vertex of each selected mesh is set to `Y = 0` in world space, removing per-vertex depth variation while leaving each object's origin in place.
+
 ---
 
 #### Hole
@@ -139,6 +142,39 @@ Makes a fully local, single-user copy of the material on each selected object. T
 
 #### Override Same
 Same as Override Single, but after creating the local copy it **reassigns it to every object in the scene** that was using the same original material. Use this when multiple objects share a material and you want them all to switch to an editable local copy in one click.
+
+#### Purge Unused Materials
+Deletes every material that is **not assigned to any object slot** in the scene. Unlike Blender's built-in *File → Clean Up → Purge*, this ignores the fake-user flag and checks real slot assignments directly, so it removes orphaned materials that the built-in purge leaves behind (common after repeated Override operations).
+
+---
+
+## Render Setup
+
+> ⚠️ **Pipeline-specific.** This section is hardcoded for a particular project's
+> collection naming and output paths. It is unlikely to be useful as-is in another
+> project without editing the source.
+
+#### Create Other Layers *(toggle)*
+When **ON**, Mouth Setup also creates a separate render layer for every non-mouth, non-Tech collection in the scene (each shown on its own with Tech included). When **OFF** (default), only the mouth/eye shape layers are created.
+
+#### Mouth Setup
+Scans the collection tree and generates one view layer per mouth/eye shape, then configures the render output. Designed for multi-character lip-sync / expression rendering.
+
+**View layers created** — one per collection whose (case-insensitive) base name is one of:
+`EyesClosed`, `EyesHalf`, `Closed`, `Wide`, `Small`, `Round`, `Neutral`.
+
+- Shapes inside a character collection are named `CharacterName_Shape` (e.g. `Joe_Wide`); `.001`-style duplicate suffixes are ignored for matching.
+- Each layer turns on **only** its target shape plus the **Tech** collection; all other collections and characters are turned off.
+- **Companion collections** (per character):
+  - **Body** — included on every layer
+  - **EyesOpen** — included on every layer *except* the `EyesClosed` / `EyesHalf` layers
+  - **Neutral** — additionally included on the `EyesClosed` / `EyesHalf` layers (mouth at rest)
+
+**Render output configured:**
+- Format → **Multilayer EXR**, 16-bit half float (Blender 5.0 `media_type`)
+- Color management → **Filmic**
+- Frame range → **1 to 1**
+- Output path → `…/Characters/<blend name>/<blend name>` (the per-character folder is created automatically)
 
 ---
 
