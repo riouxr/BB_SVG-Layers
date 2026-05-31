@@ -1343,6 +1343,199 @@ class SVG_OT_PurgeUnusedMaterials(bpy.types.Operator):
 
 
 # ─────────────────────────────────────────────
+#  Operator: Mouth Setup
+# ─────────────────────────────────────────────
+
+_MOUTH_SHAPES    = {"EyesClosed", "EyesHalf", "Closed", "Wide", "Small", "Round", "Neutral"}
+_TECH_COLLECTION = "Tech"
+
+# Per-character companion collections that ride along with the mouth shape but
+# never get their own standalone render layer.
+_COMPANION_ALWAYS  = {"Body"}      # included on every layer
+_COMPANION_EYES    = {"EyesOpen"}  # included EXCEPT on the closed-eye layers
+# The closed-eye layers get the mouth in Neutral and drop EyesOpen.
+_EYE_CLOSED_LAYERS = {"EyesClosed", "EyesHalf"}
+_NEUTRAL_NAME      = "Neutral"     # mouth-rest collection added on closed-eye layers
+_COMPANION_NAMES   = _COMPANION_ALWAYS | _COMPANION_EYES
+
+
+class SVG_OT_MouthSetup(bpy.types.Operator):
+    """Scan the scene for mouth/eye collections (handles .001 suffixes and
+    character sub-collections), create one view layer per match named
+    CharacterName_Shape, include Tech in every layer, and set the render
+    output to Multilayer EXR with Filmic color space."""
+    bl_idname  = "svg_layer.mouth_setup"
+    bl_label   = "Mouth Setup"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    # ── helpers ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def _collect_include_names(root_lc, match_names):
+        """Return the set of collection names that must be INCLUDED for a layer.
+
+        For every collection whose name is in match_names, we include it, its
+        whole subtree, and its full ancestor chain (Blender needs the parent
+        chain open for a nested collection to be visible)."""
+        include = set()
+
+        def add_subtree(lc):
+            for child in lc.children:
+                include.add(child.collection.name)
+                add_subtree(child)
+
+        def walk(lc, ancestor_names):
+            name = lc.collection.name
+            if name in match_names:
+                include.update(ancestor_names)   # open the parent chain
+                include.add(name)                # the matched collection
+                add_subtree(lc)                  # and everything inside it
+            for child in lc.children:
+                walk(child, ancestor_names + [name])
+
+        for child in root_lc.children:
+            walk(child, [])
+        return include
+
+    @staticmethod
+    def _apply_excludes(lc, include_names):
+        """Set exclude flags strictly TOP-DOWN (parent before children).
+
+        Toggling a collection's exclude to False resets its descendants to
+        included, so we MUST set each parent before its children — then we
+        immediately overwrite each child with its correct value, making the
+        result independent of Blender's reset-on-include behaviour."""
+        for child in lc.children:
+            child.exclude = (child.collection.name not in include_names)
+            SVG_OT_MouthSetup._apply_excludes(child, include_names)
+
+    @staticmethod
+    def _find_targets(col, mouth_results, other_results, parent_col):
+        """Recursively walk the collection tree.
+
+        - Mouth shapes   → mouth_results  as (vl_name, collection, parent_col)
+        - Other collections (non-mouth, non-Tech, non-companion, no mouth
+          descendants) → other_results    as (vl_name, collection, parent_col)
+        - Tech and companion collections (Body / EyesOpen) are skipped here —
+          they never get their own layer and are added via companion logic.
+        - Collections that contain mouth shapes are character containers:
+          we recurse into them but do NOT add them as 'other'.
+
+        Returns True if any mouth shape was found in this subtree."""
+        found_mouth = False
+        for child in col.children:
+            base = child.name.split('.')[0]
+
+            if base == _TECH_COLLECTION or base in _COMPANION_NAMES:
+                continue  # never a standalone layer
+
+            if base in _MOUTH_SHAPES:
+                vl_name = f"{parent_col.name}_{base}" if parent_col else base
+                mouth_results.append((vl_name, child, parent_col))
+                found_mouth = True
+            else:
+                # Recurse first to discover if this subtree contains mouth shapes
+                sub_mouth = []
+                sub_other = []
+                has_mouth = SVG_OT_MouthSetup._find_targets(
+                    child, sub_mouth, sub_other, parent_col=child)
+                mouth_results.extend(sub_mouth)
+                other_results.extend(sub_other)
+
+                if has_mouth:
+                    found_mouth = True   # character container — not 'other'
+                else:
+                    vl_name = f"{parent_col.name}_{child.name}" if parent_col else child.name
+                    other_results.append((vl_name, child, parent_col))
+
+        return found_mouth
+
+    @staticmethod
+    def _companion_names(target_col, parent_col, scene, target_base):
+        """Return the names of companion sibling collections to include.
+
+        - Body      → always
+        - EyesOpen  → except on the closed-eye layers (EyesClosed / EyesHalf)
+        - Neutral   → added on the closed-eye layers (mouth at rest)
+        """
+        container = parent_col if parent_col is not None else scene.collection
+        is_closed_eye = target_base in _EYE_CLOSED_LAYERS
+        names = []
+        for sib in container.children:
+            sbase = sib.name.split('.')[0]
+            if sbase in _COMPANION_ALWAYS:
+                names.append(sib.name)
+            elif sbase in _COMPANION_EYES and not is_closed_eye:
+                names.append(sib.name)
+            elif sbase == _NEUTRAL_NAME and is_closed_eye:
+                names.append(sib.name)
+        return names
+
+    # ── execute ───────────────────────────────────────────────────────
+
+    def execute(self, context):
+        scene = context.scene
+
+        # Render output — EXR (multilayer output is automatic when multiple
+        # view layers / passes are active; OPEN_EXR_MULTILAYER was removed in Blender 5.0)
+        scene.render.image_settings.file_format = 'OPEN_EXR'
+        # Color management — Filmic
+        scene.view_settings.view_transform = 'Filmic'
+
+        # Tech collection (may be None — handled gracefully)
+        tech_col = bpy.data.collections.get(_TECH_COLLECTION)
+
+        # Walk the collection tree to find mouth/eye collections and, optionally,
+        # every other collection that is not Tech and not a mouth shape.
+        mouth_targets = []   # (vl_name, Collection, parent_col)
+        other_targets = []
+        self._find_targets(scene.collection, mouth_targets, other_targets, parent_col=None)
+
+        # Tag each target with whether it is a mouth shape (companions apply).
+        targets = [(name, col, parent, True) for (name, col, parent) in mouth_targets]
+        if context.scene.svg_layer_other_layers:
+            targets += [(name, col, parent, False) for (name, col, parent) in other_targets]
+
+        if not targets:
+            self.report({'WARNING'},
+                "No mouth/eye collections found. "
+                f"Expected names: {', '.join(sorted(_MOUTH_SHAPES))}")
+            return {'CANCELLED'}
+
+        created = []
+        updated = []
+
+        for vl_name, target_col, parent_col, is_mouth in targets:
+            vl = scene.view_layers.get(vl_name)
+            if vl is None:
+                vl = scene.view_layers.new(vl_name)
+                created.append(vl_name)
+            else:
+                updated.append(vl_name)
+
+            # Build the set of collection names that must be ON for this layer.
+            match_names = {target_col.name}
+            if tech_col is not None:
+                match_names.add(tech_col.name)
+            if is_mouth:
+                target_base = target_col.name.split('.')[0]
+                match_names.update(
+                    self._companion_names(target_col, parent_col, scene, target_base))
+
+            include_names = self._collect_include_names(vl.layer_collection, match_names)
+            self._apply_excludes(vl.layer_collection, include_names)
+
+        parts = []
+        if created:
+            parts.append(f"Created: {', '.join(created)}")
+        if updated:
+            parts.append(f"Updated: {', '.join(updated)}")
+        parts.append("Output → EXR · Filmic")
+        self.report({'INFO'}, " | ".join(parts))
+        return {'FINISHED'}
+
+
+# ─────────────────────────────────────────────
 
 class SVG_OT_AutoStack(bpy.types.Operator):
     """Assign Y positions based on SVG document order (bottom layer = Y 0,
@@ -1923,6 +2116,11 @@ class SVG_PT_LayerPanel(bpy.types.Panel):
         box.operator("svg_layer.override_material_same", icon='LIBRARY_DATA_OVERRIDE')
         box.operator("svg_layer.purge_unused_materials", icon='TRASH')
 
+        box = layout.box()
+        box.label(text="Render Setup", icon='RENDERLAYERS')
+        box.prop(context.scene, "svg_layer_other_layers")
+        box.operator("svg_layer.mouth_setup", icon='SHAPEKEY_DATA')
+
 
 # ─────────────────────────────────────────────
 #  Registration
@@ -2027,6 +2225,7 @@ classes = (
     SVG_OT_OverrideMaterial,
     SVG_OT_OverrideMaterialSame,
     SVG_OT_PurgeUnusedMaterials,
+    SVG_OT_MouthSetup,
     SVG_OT_AutoStack,
     SVG_OT_AutoStackSelected,
     SVG_OT_HoleBoolean,
@@ -2069,6 +2268,13 @@ def register():
         precision=2,
     )
 
+    bpy.types.Scene.svg_layer_other_layers = bpy.props.BoolProperty(
+        name="Create Other Layers",
+        description="Also create a render layer for every non-mouth collection "
+                    "(excluding Tech), each shown separately with Tech included",
+        default=False,
+    )
+
 
 def unregister():
     for cls in reversed(classes):
@@ -2076,3 +2282,4 @@ def unregister():
     del bpy.types.Scene.svg_layer_all_others
     del bpy.types.Scene.svg_layer_step
     del bpy.types.Scene.svg_layer_randomize_amount
+    del bpy.types.Scene.svg_layer_other_layers
