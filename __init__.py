@@ -1361,6 +1361,10 @@ _EYE_CLOSED_LAYERS = {"eyesclosed", "eyeshalf"}
 _NEUTRAL_NAME      = "neutral"     # mouth-rest collection added on closed-eye layers
 _COMPANION_NAMES   = _COMPANION_ALWAYS | _COMPANION_EYES
 
+# Base directory for Mouth Setup render output. Each .blend gets its own
+# sub-folder named after the file, e.g. Bob.blend → <base>/Bob/Bob.exr
+_RENDER_OUTPUT_BASE = r"E:\Godot\CareerPolitician\files\Images\Characters"
+
 
 class SVG_OT_MouthSetup(bpy.types.Operator):
     """Scan the scene for mouth/eye collections (handles .001 suffixes and
@@ -1480,12 +1484,34 @@ class SVG_OT_MouthSetup(bpy.types.Operator):
     def execute(self, context):
         scene = context.scene
 
-        # Render output — EXR (multilayer output is automatic when multiple
-        # view layers / passes are active; OPEN_EXR_MULTILAYER was removed in Blender 5.0)
-        scene.render.image_settings.file_format = 'OPEN_EXR'
-        scene.render.image_settings.color_depth = '16'   # half float
+        # Render output — Multilayer EXR (half float).
+        img = scene.render.image_settings
+        if hasattr(img, "media_type"):
+            # Blender 5.0+: select multilayer via media_type first; the
+            # file_format enum then only offers OPEN_EXR_MULTILAYER.
+            img.media_type  = 'MULTI_LAYER_IMAGE'
+            img.file_format = 'OPEN_EXR_MULTILAYER'
+        else:
+            # Older Blender: dedicated multilayer file format.
+            try:
+                img.file_format = 'OPEN_EXR_MULTILAYER'
+            except (TypeError, ValueError):
+                img.file_format = 'OPEN_EXR'
+        img.color_depth = '16'   # half float
+
         # Color management — Filmic
         scene.view_settings.view_transform = 'Filmic'
+
+        # Render a single frame (1 → 1)
+        scene.frame_start = 1
+        scene.frame_end   = 1
+
+        # Output path = <base>/<blend name>/<blend name>  (e.g. .../Bob/Bob.exr)
+        if bpy.data.filepath:
+            blend_name = os.path.splitext(os.path.basename(bpy.data.filepath))[0]
+            out_dir = os.path.join(_RENDER_OUTPUT_BASE, blend_name)
+            os.makedirs(out_dir, exist_ok=True)
+            scene.render.filepath = os.path.join(out_dir, blend_name)
 
         # Tech collection — case-insensitive lookup (may be None — handled gracefully)
         tech_col = next(
