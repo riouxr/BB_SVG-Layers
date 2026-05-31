@@ -1346,16 +1346,19 @@ class SVG_OT_PurgeUnusedMaterials(bpy.types.Operator):
 #  Operator: Mouth Setup
 # ─────────────────────────────────────────────
 
-_MOUTH_SHAPES    = {"EyesClosed", "EyesHalf", "Closed", "Wide", "Small", "Round", "Neutral"}
-_TECH_COLLECTION = "Tech"
+# All collection-name matching below is CASE-INSENSITIVE: names are compared
+# in lower case, so "Wide", "wide" and "WIDE" are treated the same. The actual
+# collection casing is still used verbatim when building view-layer names.
+_MOUTH_SHAPES    = {"eyesclosed", "eyeshalf", "closed", "wide", "small", "round", "neutral"}
+_TECH_COLLECTION = "tech"
 
 # Per-character companion collections that ride along with the mouth shape but
 # never get their own standalone render layer.
-_COMPANION_ALWAYS  = {"Body"}      # included on every layer
-_COMPANION_EYES    = {"EyesOpen"}  # included EXCEPT on the closed-eye layers
+_COMPANION_ALWAYS  = {"body"}      # included on every layer
+_COMPANION_EYES    = {"eyesopen"}  # included EXCEPT on the closed-eye layers
 # The closed-eye layers get the mouth in Neutral and drop EyesOpen.
-_EYE_CLOSED_LAYERS = {"EyesClosed", "EyesHalf"}
-_NEUTRAL_NAME      = "Neutral"     # mouth-rest collection added on closed-eye layers
+_EYE_CLOSED_LAYERS = {"eyesclosed", "eyeshalf"}
+_NEUTRAL_NAME      = "neutral"     # mouth-rest collection added on closed-eye layers
 _COMPANION_NAMES   = _COMPANION_ALWAYS | _COMPANION_EYES
 
 
@@ -1424,12 +1427,13 @@ class SVG_OT_MouthSetup(bpy.types.Operator):
         Returns True if any mouth shape was found in this subtree."""
         found_mouth = False
         for child in col.children:
-            base = child.name.split('.')[0]
+            base    = child.name.split('.')[0]   # actual casing (used in layer name)
+            base_lc = base.lower()               # for case-insensitive matching
 
-            if base == _TECH_COLLECTION or base in _COMPANION_NAMES:
+            if base_lc == _TECH_COLLECTION or base_lc in _COMPANION_NAMES:
                 continue  # never a standalone layer
 
-            if base in _MOUTH_SHAPES:
+            if base_lc in _MOUTH_SHAPES:
                 vl_name = f"{parent_col.name}_{base}" if parent_col else base
                 mouth_results.append((vl_name, child, parent_col))
                 found_mouth = True
@@ -1459,10 +1463,10 @@ class SVG_OT_MouthSetup(bpy.types.Operator):
         - Neutral   → added on the closed-eye layers (mouth at rest)
         """
         container = parent_col if parent_col is not None else scene.collection
-        is_closed_eye = target_base in _EYE_CLOSED_LAYERS
+        is_closed_eye = target_base.lower() in _EYE_CLOSED_LAYERS
         names = []
         for sib in container.children:
-            sbase = sib.name.split('.')[0]
+            sbase = sib.name.split('.')[0].lower()
             if sbase in _COMPANION_ALWAYS:
                 names.append(sib.name)
             elif sbase in _COMPANION_EYES and not is_closed_eye:
@@ -1479,11 +1483,15 @@ class SVG_OT_MouthSetup(bpy.types.Operator):
         # Render output — EXR (multilayer output is automatic when multiple
         # view layers / passes are active; OPEN_EXR_MULTILAYER was removed in Blender 5.0)
         scene.render.image_settings.file_format = 'OPEN_EXR'
+        scene.render.image_settings.color_depth = '16'   # half float
         # Color management — Filmic
         scene.view_settings.view_transform = 'Filmic'
 
-        # Tech collection (may be None — handled gracefully)
-        tech_col = bpy.data.collections.get(_TECH_COLLECTION)
+        # Tech collection — case-insensitive lookup (may be None — handled gracefully)
+        tech_col = next(
+            (c for c in bpy.data.collections
+             if c.name.split('.')[0].lower() == _TECH_COLLECTION),
+            None)
 
         # Walk the collection tree to find mouth/eye collections and, optionally,
         # every other collection that is not Tech and not a mouth shape.
