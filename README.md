@@ -1,5 +1,10 @@
 # BB SVG Layers — Blender Addon
 
+> ⚠️ **Note:** This tool was designed for a specific project. Some functions are
+> hardcoded for my own pipeline (e.g. fixed output paths, naming conventions, and
+> collection structures) and may not be usable as-is for anyone else. Feel free to
+> fork and adapt it to your own needs.
+
 A Blender 4.2+ extension that automates the full pipeline for converting imported SVG layers into game-ready 3D paper cutout meshes. It handles geometry processing, UV projection, material creation from a master material, automatic export to the asset library, and intelligent layer stacking — including multi-character scenes with automatic collection sorting.
 
 ---
