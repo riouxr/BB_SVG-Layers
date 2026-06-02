@@ -1,3 +1,14 @@
+bl_info = {
+    "name": "BB SVG Layers",
+    "author": "Blender Bob & Claude",
+    "version": (3, 1, 2),
+    "blender": (3, 4, 0),
+    "location": "3D Viewport > N-Panel > SVG Layer",
+    "description": "Convert SVG layers into paper cutout 3D meshes with auto stacking and asset materials (Blender 3.4 legacy-addon build)",
+    "category": "Import-Export",
+    "doc_url": "https://github.com/riouxr/BB_SVG-Layers",
+}
+
 import bpy
 import math
 import mathutils
