@@ -1346,20 +1346,41 @@ class SVG_OT_PurgeUnusedMaterials(bpy.types.Operator):
 #  Operator: Mouth Setup
 # ─────────────────────────────────────────────
 
-# All collection-name matching below is CASE-INSENSITIVE: names are compared
-# in lower case, so "Wide", "wide" and "WIDE" are treated the same. The actual
-# collection casing is still used verbatim when building view-layer names.
-_MOUTH_SHAPES    = {"eyesclosed", "eyeshalf", "closed", "wide", "small", "round", "neutral"}
-_TECH_COLLECTION = "tech"
+# Collection-name matching is CASE-INSENSITIVE and PREFIX-based: a collection
+# matches a keyword if its name STARTS WITH that keyword, so any trailing suffix
+# is ignored — ".001", " 2", "_old", ".LOD1", whatever. The matched canonical
+# keyword (not the raw collection name) is used when building view-layer names.
+#
+# Canonical shape names, ordered longest-first so that when one keyword is a
+# prefix of another the longer (more specific) one wins.
+_MOUTH_SHAPES = ("EyesClosed", "EyesHalf", "Neutral", "Closed", "Round", "Small", "Wide")
+_TECH_KW      = "tech"
 
 # Per-character companion collections that ride along with the mouth shape but
 # never get their own standalone render layer.
-_COMPANION_ALWAYS  = {"body"}      # included on every layer
-_COMPANION_EYES    = {"eyesopen"}  # included EXCEPT on the closed-eye layers
-# The closed-eye layers get the mouth in Neutral and drop EyesOpen.
-_EYE_CLOSED_LAYERS = {"eyesclosed", "eyeshalf"}
-_NEUTRAL_NAME      = "neutral"     # mouth-rest collection added on closed-eye layers
-_COMPANION_NAMES   = _COMPANION_ALWAYS | _COMPANION_EYES
+_BODY_KW           = "body"        # included on every layer
+_EYESOPEN_KW       = "eyesopen"    # included EXCEPT on the closed-eye layers
+_NEUTRAL_KW        = "neutral"     # mouth-rest collection added on closed-eye layers
+_EYE_CLOSED_LAYERS = ("eyesclosed", "eyeshalf")   # shapes that suppress EyesOpen
+
+
+def _starts_with(name, keyword):
+    """True if collection name starts with keyword (case-insensitive)."""
+    return name.lower().startswith(keyword.lower())
+
+
+def _match_shape(name):
+    """Return the canonical mouth-shape whose keyword starts name, else None."""
+    low = name.lower()
+    for shape in _MOUTH_SHAPES:
+        if low.startswith(shape.lower()):
+            return shape
+    return None
+
+
+def _is_companion(name):
+    """True if name is a Body/EyesOpen companion (never its own layer)."""
+    return _starts_with(name, _BODY_KW) or _starts_with(name, _EYESOPEN_KW)
 
 # Base directory for Mouth Setup render output. Each .blend gets its own
 # sub-folder named after the file, e.g. Bob.blend → <base>/Bob/Bob.exr
@@ -1431,14 +1452,12 @@ class SVG_OT_MouthSetup(bpy.types.Operator):
         Returns True if any mouth shape was found in this subtree."""
         found_mouth = False
         for child in col.children:
-            base    = child.name.split('.')[0]   # actual casing (used in layer name)
-            base_lc = base.lower()               # for case-insensitive matching
-
-            if base_lc == _TECH_COLLECTION or base_lc in _COMPANION_NAMES:
+            if _starts_with(child.name, _TECH_KW) or _is_companion(child.name):
                 continue  # never a standalone layer
 
-            if base_lc in _MOUTH_SHAPES:
-                vl_name = f"{parent_col.name}_{base}" if parent_col else base
+            shape = _match_shape(child.name)   # canonical name or None
+            if shape is not None:
+                vl_name = f"{parent_col.name}_{shape}" if parent_col else shape
                 mouth_results.append((vl_name, child, parent_col))
                 found_mouth = True
             else:
@@ -1470,12 +1489,11 @@ class SVG_OT_MouthSetup(bpy.types.Operator):
         is_closed_eye = target_base.lower() in _EYE_CLOSED_LAYERS
         names = []
         for sib in container.children:
-            sbase = sib.name.split('.')[0].lower()
-            if sbase in _COMPANION_ALWAYS:
+            if _starts_with(sib.name, _BODY_KW):
                 names.append(sib.name)
-            elif sbase in _COMPANION_EYES and not is_closed_eye:
+            elif _starts_with(sib.name, _EYESOPEN_KW) and not is_closed_eye:
                 names.append(sib.name)
-            elif sbase == _NEUTRAL_NAME and is_closed_eye:
+            elif _starts_with(sib.name, _NEUTRAL_KW) and is_closed_eye:
                 names.append(sib.name)
         return names
 
@@ -1513,10 +1531,9 @@ class SVG_OT_MouthSetup(bpy.types.Operator):
             os.makedirs(out_dir, exist_ok=True)
             scene.render.filepath = os.path.join(out_dir, blend_name)
 
-        # Tech collection — case-insensitive lookup (may be None — handled gracefully)
+        # Tech collection — prefix lookup (may be None — handled gracefully)
         tech_col = next(
-            (c for c in bpy.data.collections
-             if c.name.split('.')[0].lower() == _TECH_COLLECTION),
+            (c for c in bpy.data.collections if _starts_with(c.name, _TECH_KW)),
             None)
 
         # Walk the collection tree to find mouth/eye collections and, optionally,
@@ -1552,7 +1569,9 @@ class SVG_OT_MouthSetup(bpy.types.Operator):
             if tech_col is not None:
                 match_names.add(tech_col.name)
             if is_mouth:
-                target_base = target_col.name.split('.')[0]
+                # Canonical shape (e.g. "EyesClosed") so closed-eye detection
+                # works regardless of the collection's trailing suffix.
+                target_base = _match_shape(target_col.name) or target_col.name
                 match_names.update(
                     self._companion_names(target_col, parent_col, scene, target_base))
 
