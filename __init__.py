@@ -229,30 +229,55 @@ def _ensure_catalog(lib_root, catalog_name):
     return uid
 
 
+def _iter_asset_library_roots():
+    """Yield the absolute root path of every configured asset library
+    (de-duplicated, existing directories only)."""
+    seen = set()
+    for lib in bpy.context.preferences.filepaths.asset_libraries:
+        root = bpy.path.abspath(lib.path)
+        if root and os.path.isdir(root) and root not in seen:
+            seen.add(root)
+            yield root
+
+
+def _append_master_from_blend(blend_path):
+    """Append a material named 'Master' from blend_path if present.
+    Returns the material or None."""
+    if not os.path.isfile(blend_path):
+        return None
+    try:
+        with bpy.data.libraries.load(blend_path, link=False) as (src, dst):
+            if "Master" in src.materials:
+                dst.materials = ["Master"]
+    except Exception as exc:
+        print(f"[SVG Layer] Could not read {blend_path}: {exc}")
+        return None
+    # dst.materials is populated after the with-block closes
+    return bpy.data.materials.get("Master")
+
+
 def _load_master_from_library():
-    """Try to load the 'Master' material from the Paper asset library if it
-    is not already present in the current file.  Returns the material or None."""
+    """Find and append the 'Master' material from ANY configured asset library
+    if it is not already present in the current file. Returns it or None."""
     if bpy.data.materials.get("Master"):
         return bpy.data.materials["Master"]
 
-    lib_root = get_user_library_path()
-    if lib_root is None:
-        return None
+    roots = list(_iter_asset_library_roots())
 
-    # Walk every .blend inside the library looking for a material named Master
-    for root, dirs, files in os.walk(lib_root):
-        for fname in files:
-            if not fname.lower().endswith(".blend"):
-                continue
-            blend_path = os.path.join(root, fname)
-            # Peek at the material names without fully loading the file
-            with bpy.data.libraries.load(blend_path, link=False) as (src, dst):
-                if "Master" in src.materials:
-                    dst.materials = ["Master"]
-            # dst.materials is populated after the with-block closes
-            mat = bpy.data.materials.get("Master")
-            if mat:
-                return mat
+    # Fast path: the exact file our exporter writes, <root>/Paper/Paper.blend
+    for root in roots:
+        mat = _append_master_from_blend(os.path.join(root, "Paper", "Paper.blend"))
+        if mat:
+            return mat
+
+    # Fallback: walk every library for any .blend containing 'Master'
+    for root in roots:
+        for cur, dirs, files in os.walk(root):
+            for fname in files:
+                if fname.lower().endswith(".blend"):
+                    mat = _append_master_from_blend(os.path.join(cur, fname))
+                    if mat:
+                        return mat
 
     return None
 
