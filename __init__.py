@@ -213,6 +213,7 @@ def get_user_library_path():
 
 
 def _ensure_catalog(lib_root, catalog_name):
+    os.makedirs(lib_root, exist_ok=True)   # library folder may not exist yet
     cats_path = os.path.join(lib_root, "blender_assets.cats.txt")
     h = hashlib.md5(catalog_name.encode()).hexdigest()
     uid = f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
@@ -287,6 +288,14 @@ def mark_and_export_materials(materials, catalog_name="Paper"):
     lib_root = get_user_library_path()
     if lib_root is None:
         return False, "No asset library configured in Preferences > File Paths > Asset Libraries."
+
+    # The configured library folder may not exist on disk yet — create it,
+    # and report a clean error instead of crashing if that isn't possible.
+    try:
+        os.makedirs(lib_root, exist_ok=True)
+    except OSError as exc:
+        return False, (f"Asset library path is not writable: {lib_root}\n"
+                       f"({exc}). Check Preferences > File Paths > Asset Libraries.")
 
     uid = _ensure_catalog(lib_root, catalog_name)
 
